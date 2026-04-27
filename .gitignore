@@ -1,21 +1,39 @@
+# Python
 *.pyc
+*.py[cod]
 __pycache__/
-*.py[o]
-db.sqlite3
+*$py.class
+
+# Virtual environments
 /venv
+.venv/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# Database
+db.sqlite3
+
+# Media
 /media/
-/static
+/static/
+
+# Environment
 .env
+
+# Testing
 .eggs
 *.egg-info/
 dist/
 build/
 *.log
-local_settings.py
-*.sqlite3
 .pytest_cache/
 .coverage
 htmlcov/
+
+# OS
 .DS_Store
 *.swp
 *.swo
