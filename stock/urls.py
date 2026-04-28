@@ -5,7 +5,8 @@ from .views import (
     AttributeTypeViewSet, AttributeValueViewSet,
     TaxCodeViewSet, TaxComponentViewSet,
     ItemViewSet, ItemVariantViewSet, ItemImageViewSet,
-    BatchViewSet, OpeningStockViewSet, StockMovementViewSet
+    BatchViewSet, OpeningStockViewSet, StockMovementViewSet,
+    SerialNumberViewSet
 )
 
 router = DefaultRouter()
@@ -19,6 +20,7 @@ router.register(r'items', ItemViewSet)
 router.register(r'batches', BatchViewSet)
 router.register(r'opening-stock', OpeningStockViewSet)
 router.register(r'stock-movements', StockMovementViewSet)
+router.register(r'serial-numbers', SerialNumberViewSet)
 
 urlpatterns = [
     path('', include(router.urls)),

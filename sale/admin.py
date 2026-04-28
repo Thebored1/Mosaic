@@ -51,15 +51,15 @@ class InvoiceItemInline(admin.TabularInline):
 
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
-    list_display = ['invoice_number', 'party', 'business_location', 'invoice_date', 'grand_total', 'is_finalized', 'is_cancelled']
-    list_filter = ['is_finalized', 'is_cancelled', 'business_location', 'invoice_type']
+    list_display = ['invoice_number', 'party', 'business_location', 'invoice_date', 'grand_total', 'status']
+    list_filter = ['status', 'business_location', 'invoice_type']
     search_fields = ['invoice_number', 'party__name']
     inlines = [InvoiceItemInline]
 
 
 @admin.register(Receipt)
 class ReceiptAdmin(admin.ModelAdmin):
-    list_display = ['receipt_number', 'invoice', 'party', 'amount', 'payment_mode', 'transaction_date']
+    list_display = ['receipt_number', 'party', 'amount', 'payment_mode', 'transaction_date']
     list_filter = ['payment_mode', 'business_location']
     search_fields = ['receipt_number']
 
@@ -104,20 +104,20 @@ class PurchaseInvoiceItemInline(admin.TabularInline):
 
 @admin.register(PurchaseInvoice)
 class PurchaseInvoiceAdmin(admin.ModelAdmin):
-    list_display = ['invoice_number', 'supplier', 'business_location', 'invoice_date', 'grand_total', 'is_finalized']
-    list_filter = ['is_finalized', 'business_location']
+    list_display = ['invoice_number', 'supplier', 'business_location', 'invoice_date', 'grand_total', 'status']
+    list_filter = ['status', 'business_location']
     search_fields = ['invoice_number']
     inlines = [PurchaseInvoiceItemInline]
 
 
 @admin.register(DebitNote)
 class DebitNoteAdmin(admin.ModelAdmin):
-    list_display = ['debit_note_number', 'purchase_invoice', 'supplier', 'amount', 'created_at']
+    list_display = ['debit_note_number', 'supplier', 'amount', 'created_at']
     search_fields = ['debit_note_number']
 
 
 @admin.register(PaymentOut)
 class PaymentOutAdmin(admin.ModelAdmin):
-    list_display = ['payment_number', 'purchase_invoice', 'supplier', 'amount', 'payment_mode', 'transaction_date']
+    list_display = ['payment_number', 'supplier', 'amount', 'payment_mode', 'transaction_date']
     list_filter = ['payment_mode', 'business_location']
     search_fields = ['payment_number']

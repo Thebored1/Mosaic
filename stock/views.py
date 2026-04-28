@@ -446,3 +446,18 @@ class StockMovementViewSet(viewsets.ModelViewSet):
     search_fields = ['reference_number', 'item__sku']
     ordering_fields = ['movement_date', 'id']
     ordering = ['-movement_date']
+
+
+class SerialNumberViewSet(viewsets.ModelViewSet):
+    """ViewSet for SerialNumber."""
+    from .models import SerialNumber
+    from .serializers import SerialNumberSerializer
+    
+    queryset = SerialNumber.objects.all()
+    serializer_class = SerialNumberSerializer
+    pagination_class = StandardPagination
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ['status', 'item', 'item_variant', 'warehouse']
+    search_fields = ['serial_number', 'notes']
+    ordering_fields = ['created_at', 'serial_number']
+    ordering = ['-created_at']

@@ -18,6 +18,7 @@ Each model includes detailed documentation explaining:
 
 from decimal import Decimal
 from django.db import models
+from django.db.models import F
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 from django.contrib.auth.models import User
@@ -122,20 +123,11 @@ class BusinessLocation(models.Model):
         return f"{self.trade_name or self.legal_name} ({self.gstin})"
 
     def get_next_invoice_number(self):
-        """
-        Generate next invoice number for this location.
-
-        Format: {GSTIN}/{FY}/{(sequence:05d)}
-        Example: 27AAAAA0000A1Z5/2025-26/00001
-
-        Interaction:
-        - Increments invoice_sequence by 1
-        - Uses current financial year
-        - Called by Invoice.save() during finalization
-        """
-        self.invoice_sequence += 1
-        self.save(update_fields=['invoice_sequence'])
-
+        """Generate next invoice number with race condition protection."""
+        BusinessLocation.objects.filter(pk=self.pk).update(
+            invoice_sequence=F('invoice_sequence') + 1
+        )
+        self.refresh_from_db()
         fy = self.get_current_financial_year()
         return f"{self.gstin}/{fy}/{self.invoice_sequence:05d}"
 
@@ -144,6 +136,15 @@ class BusinessLocation(models.Model):
         if today.month >= 4:
             return f"{today.year}-{today.year + 1}"
         return f"{today.year - 1}-{today.year}"
+
+    def get_next_purchase_invoice_number(self):
+        """Generate next purchase invoice number with race condition protection."""
+        BusinessLocation.objects.filter(pk=self.pk).update(
+            purchase_invoice_sequence=F('purchase_invoice_sequence') + 1
+        )
+        self.refresh_from_db()
+        fy = self.get_current_financial_year()
+        return f"{self.gstin}/PI/{fy}/{self.purchase_invoice_sequence:05d}"
 
     def clean(self):
         super().clean()
@@ -244,6 +245,7 @@ class Party(models.Model):
         help_text="Date as of which opening balance is calculated"
     )
     is_active = models.BooleanField(default=True)
+    loyalty_points = models.PositiveIntegerField(default=0)
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -281,31 +283,27 @@ class Party(models.Model):
 
         # Sales outstanding
         sales_invoiced = self.invoices.filter(
-            is_finalized=True, is_cancelled=False
+            status='Finalized'
         ).aggregate(total=Sum('grand_total'))['total'] or Decimal('0')
 
         sales_received = self.receipts.aggregate(
             total=Sum('amount')
         )['total'] or Decimal('0')
 
-        sales_credits = self.credit_notes.filter(
-            is_stock_returned=True
-        ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        sales_credits = self.credit_notes.aggregate(total=Sum('amount'))['total'] or Decimal('0')
 
         sales_outstanding = sales_invoiced - sales_received - sales_credits
 
         # Purchase outstanding
         purchase_invoiced = self.purchase_invoices.filter(
-            is_finalized=True, is_cancelled=False
+            status='Finalized'
         ).aggregate(total=Sum('grand_total'))['total'] or Decimal('0')
 
         purchase_paid = self.payments_out.aggregate(
             total=Sum('amount')
         )['total'] or Decimal('0')
 
-        purchase_debits = self.debit_notes.filter(
-            is_stock_returned=True
-        ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        purchase_debits = self.debit_notes.aggregate(total=Sum('amount'))['total'] or Decimal('0')
 
         purchase_outstanding = purchase_invoiced - purchase_paid - purchase_debits
 
@@ -323,11 +321,10 @@ class Order(models.Model):
     - Can be converted to finalized invoice
 
     Interaction:
-    - FK to OrderItem (line items)
+    - FK to OrderItem (line items via order.order_items)
     - FK to Party (optional customer)
     - FK to BusinessLocation (which store/branch)
     - FK to User (created_by)
-    - M2M link to Invoice (after conversion)
 
     Workflow:
     1. Create Order with items
@@ -373,11 +370,6 @@ class Order(models.Model):
         on_delete=models.PROTECT,
         related_name='orders'
     )
-    items = models.ManyToManyField(
-        'OrderItem',
-        related_name='order_items',
-        blank=True
-    )
     sub_total = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -393,6 +385,12 @@ class Order(models.Model):
         choices=[('Percentage', 'Percentage'), ('Fixed', 'Fixed')],
         default='Fixed'
     )
+    discount_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal('0'),
+        blank=True
+    )
     grand_total = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -407,6 +405,11 @@ class Order(models.Model):
         max_length=200,
         blank=True,
         help_text="Notes when order is put on hold"
+    )
+    customer_name = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text="Walk-in customer name (if no party selected)"
     )
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(
@@ -446,13 +449,11 @@ class Order(models.Model):
 
     def calculate_totals(self):
         """Recalculate order totals from items."""
-        total = sum(item.total for item in self.items.all())
+        total = sum(item.total for item in self.order_items.all())
         self.sub_total = total
 
         if self.discount_type == 'Percentage':
-            self.discount_amount = total * self.discount_amount / 100
-        else:
-            self.discount_amount = self.discount_amount
+            self.discount_amount = total * self.discount_percent / 100
 
         self.grand_total = total - self.discount_amount
         self.save(update_fields=['sub_total', 'discount_amount', 'grand_total'])
@@ -625,8 +626,7 @@ class Invoice(models.Model):
     FIELDS EXPLAINED:
     - invoice_type: Tax Invoice, Bill of Supply, Export, SEZ, Cash
     - billing_state: Customer's state (determines IGST vs CGST+SGST)
-    - is_finalized: False = draft, True = stock deducted, can't edit
-    - is_cancelled: True = cancelled invoice (keep for audit trail)
+    - status: Draft/Finalized/Cancelled
     - tax_summary: JSON aggregation of GST by rate
     - e_way_bill: For transactions > ₹50,000 (optional)
     - e_invoice_details: IRN, QR code for e-invoicing (optional)
@@ -716,8 +716,11 @@ class Invoice(models.Model):
         default="Goods once sold cannot be taken back. Interest @18% p.a. on delayed payments."
     )
 
-    is_finalized = models.BooleanField(default=False)
-    is_cancelled = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='Draft'
+    )
     cancelled_at = models.DateTimeField(null=True, blank=True)
     cancelled_by = models.ForeignKey(
         User,
@@ -739,11 +742,19 @@ class Invoice(models.Model):
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     created_by = models.ForeignKey(
         User,
         on_delete=models.SET_NULL,
         null=True,
         related_name='invoices_created'
+    )
+    salesperson = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='invoices_sold'
     )
 
     class Meta:
@@ -754,19 +765,10 @@ class Invoice(models.Model):
     def __str__(self):
         return f"{self.invoice_number} - ₹{self.grand_total}"
 
-    def clean(self):
-        super().clean()
-        if self.is_finalized and self.is_cancelled:
-            raise ValidationError("Cannot cancel a non-finalized invoice")
-
     def save(self, *args, **kwargs):
-        if not self.invoice_number:
-            self.invoice_number = self.business_location.get_next_invoice_number()
-
         # Set billing state from party if not set
         if not self.billing_state and self.party and self.party.state:
             self.billing_state = self.party.state
-
         super().save(*args, **kwargs)
 
     def finalize(self):
@@ -774,8 +776,8 @@ class Invoice(models.Model):
         Finalize invoice - deduct stock, update party outstanding.
 
         FLOW:
-        1. Set is_finalized = True
-        2. Generate invoice number (if not already)
+        1. Generate invoice number (must happen first)
+        2. Set status = 'Finalized'
         3. For each InvoiceItem:
            - Create StockMovement (Sale type, reduce stock)
            - If item has variants: reduce variant stock
@@ -783,12 +785,15 @@ class Invoice(models.Model):
         4. Update Order status to 'Invoiced' (if linked)
         5. Create Receipt if payment captured (optional)
         """
-        if self.is_finalized:
-            raise ValidationError("Invoice already finalized")
+        if self.status != 'Draft':
+            raise ValidationError(f"Cannot finalize invoice with status '{self.status}'")
 
-        self.is_finalized = True
+        if not self.invoice_number:
+            self.invoice_number = self.business_location.get_next_invoice_number()
+
+        self.status = 'Finalized'
         self.invoice_date = timezone.now()
-        self.save(update_fields=['is_finalized', 'invoice_date'])
+        self.save(update_fields=['status', 'invoice_date', 'invoice_number'])
 
         # Deduct stock via StockMovement
         from stock.models import StockMovement
@@ -820,19 +825,19 @@ class Invoice(models.Model):
         Cancel invoice - reverse stock, create credit note.
 
         FLOW:
-        1. Set is_cancelled = True
+        1. Set status = 'Cancelled'
         2. Record cancelled_by and cancelled_at
         3. For each InvoiceItem:
            - Create StockMovement (Return type, add stock back)
         4. Update Party outstanding
         """
-        if not self.is_finalized:
+        if self.status != 'Finalized':
             raise ValidationError("Can only cancel finalized invoices")
 
-        self.is_cancelled = True
+        self.status = 'Cancelled'
         self.cancelled_by = user
         self.cancelled_at = timezone.now()
-        self.save(update_fields=['is_cancelled', 'cancelled_by', 'cancelled_at'])
+        self.save(update_fields=['status', 'cancelled_by', 'cancelled_at'])
 
         # Reverse stock
         from stock.models import StockMovement
@@ -942,6 +947,7 @@ class InvoiceItem(models.Model):
     )
     rate = models.DecimalField(max_digits=12, decimal_places=2)
     discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'), blank=True)
 
     taxable_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
 
@@ -951,6 +957,8 @@ class InvoiceItem(models.Model):
     sgst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
     igst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
     igst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    cess_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    cess_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
 
     total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
 
@@ -964,6 +972,7 @@ class InvoiceItem(models.Model):
 
     def calculate_totals(self):
         """Calculate tax amounts based on state comparison."""
+        self.taxable_amount = (self.quantity * self.rate) - self.discount
         # Check if intra-state or inter-state
         if self.invoice.billing_state_id == self.invoice.business_location.state_id:
             # Intra-state: CGST + SGST
@@ -986,7 +995,8 @@ class InvoiceItem(models.Model):
             self.cgst_amount = Decimal('0')
             self.sgst_amount = Decimal('0')
 
-        self.total = self.taxable_amount + self.cgst_amount + self.sgst_amount + self.igst_amount
+        self.cess_amount = self.taxable_amount * self.cess_rate / 100
+        self.total = self.taxable_amount + self.cgst_amount + self.sgst_amount + self.igst_amount + self.cess_amount
 
 
 class CreditNote(models.Model):
@@ -1002,7 +1012,7 @@ class CreditNote(models.Model):
     INTERACTION:
     - FK to Invoice (original invoice being returned)
     - FK to Party (customer)
-    - M2M to InvoiceItem (items being returned)
+    - CreditNoteItem (line items being returned)
     - When is_stock_returned=True, creates StockMovement (add stock)
 
     Workflow:
@@ -1026,8 +1036,7 @@ class CreditNote(models.Model):
         on_delete=models.PROTECT,
         related_name='credit_notes'
     )
-    return_items = models.ManyToManyField(InvoiceItem, related_name='credit_notes')
-    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
     reason = models.CharField(max_length=200)
     is_stock_returned = models.BooleanField(
         default=False,
@@ -1065,6 +1074,129 @@ class CreditNote(models.Model):
                 pass
         return f"{prefix}0001"
 
+    def calculate_totals(self):
+        total = sum(item.refund_amount for item in self.items.all())
+        self.amount = total
+
+
+class CreditNoteItem(models.Model):
+    """
+    CreditNoteItem - Line Items in Credit Note
+    ============================================
+
+    Purpose: Individual items being returned in a credit note.
+
+    Fields:
+        credit_note (FK): Parent credit note
+        invoice_item (FK): Original invoice item being returned
+        quantity_returned (Decimal): Quantity being returned (supports partial)
+        rate (Decimal): Rate captured at credit note creation
+        discount (Decimal): Line-level discount
+        taxable_amount (Decimal): (quantity × rate) - discount
+        cgst_rate, sgst_rate, igst_rate (Decimal): Tax rates snapshot
+        cgst_amount, sgst_amount, igst_amount (Decimal): Tax amounts
+        refund_amount (Decimal): Total refund for this line
+    """
+    credit_note = models.ForeignKey(
+        CreditNote,
+        on_delete=models.CASCADE,
+        related_name='items'
+    )
+    invoice_item = models.ForeignKey(
+        InvoiceItem,
+        on_delete=models.PROTECT,
+        related_name='credit_note_items'
+    )
+    quantity_returned = models.DecimalField(max_digits=12, decimal_places=4)
+    rate = models.DecimalField(max_digits=12, decimal_places=2)
+    discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    taxable_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    cgst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    cgst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    sgst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    sgst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    igst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    igst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    cess_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    cess_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    refund_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+
+    class Meta:
+        verbose_name = 'Credit Note Item'
+        verbose_name_plural = 'Credit Note Items'
+
+    def save(self, *args, **kwargs):
+        self.calculate_totals()
+        super().save(*args, **kwargs)
+
+    def calculate_totals(self):
+        self.taxable_amount = (self.quantity_returned * self.rate) - self.discount
+        self.cgst_amount = self.taxable_amount * self.cgst_rate / 100
+        self.sgst_amount = self.taxable_amount * self.sgst_rate / 100
+        self.igst_amount = self.taxable_amount * self.igst_rate / 100
+        self.cess_amount = self.taxable_amount * self.cess_rate / 100
+        self.refund_amount = self.taxable_amount + self.cgst_amount + self.sgst_amount + self.igst_amount + self.cess_amount
+
+
+class ReceiptAllocation(models.Model):
+    """
+    ReceiptAllocation - Link Receipt to Invoice (for advance payments)
+    ========================================================
+
+    Purpose: Allows payments to be allocated across multiple invoices.
+
+    Fields:
+        receipt (FK): The payment receipt
+        invoice (FK): Invoice being paid
+        amount_allocated (Decimal): Amount applied to this invoice
+    """
+    receipt = models.ForeignKey(
+        'Receipt',
+        on_delete=models.CASCADE,
+        related_name='allocations'
+    )
+    invoice = models.ForeignKey(
+        Invoice,
+        on_delete=models.PROTECT,
+        related_name='receipt_allocations'
+    )
+    amount_allocated = models.DecimalField(max_digits=12, decimal_places=2)
+
+    class Meta:
+        verbose_name = 'Receipt Allocation'
+        verbose_name_plural = 'Receipt Allocations'
+        unique_together = ['receipt', 'invoice']
+
+
+class PaymentOutAllocation(models.Model):
+    """
+    PaymentOutAllocation - Link PaymentOut to PurchaseInvoice (for advance payments)
+    =======================================================================
+
+    Purpose: Allows payments to be allocated across multiple purchase invoices.
+
+    Fields:
+        payment (FK): The payment out
+        purchase_invoice (FK): Purchase invoice being paid
+        amount_allocated (Decimal): Amount applied to this invoice
+    """
+    payment = models.ForeignKey(
+        'PaymentOut',
+        on_delete=models.CASCADE,
+        related_name='allocations'
+    )
+    purchase_invoice = models.ForeignKey(
+        'PurchaseInvoice',
+        on_delete=models.PROTECT,
+        related_name='payment_allocations'
+    )
+    amount_allocated = models.DecimalField(max_digits=12, decimal_places=2)
+
+    class Meta:
+        verbose_name = 'Payment Out Allocation'
+        verbose_name_plural = 'Payment Out Allocations'
+        unique_together = ['payment', 'purchase_invoice']
+
 
 class Receipt(models.Model):
     """
@@ -1077,10 +1209,10 @@ class Receipt(models.Model):
     - Updates party outstanding
 
     INTERACTION:
-    - FK to Invoice (payment against specific invoice)
     - FK to Party (customer)
     - FK to BusinessLocation (which location received payment)
     - FK to User (received_by)
+    - ReceiptAllocation (link payments to invoices)
 
     PAYMENT MODES:
     - Cash: Default, tracked in cash drawer
@@ -1101,11 +1233,6 @@ class Receipt(models.Model):
     - GET /sale/receipts/{id}/ - Payment detail
     """
     receipt_number = models.CharField(max_length=20, unique=True)
-    invoice = models.ForeignKey(
-        Invoice,
-        on_delete=models.PROTECT,
-        related_name='receipts'
-    )
     party = models.ForeignKey(
         Party,
         on_delete=models.PROTECT,
@@ -1179,7 +1306,7 @@ class PurchaseOrder(models.Model):
     INTERACTION:
     - FK to Party (supplier)
     - FK to BusinessLocation (ordering location)
-    - M2M to POItem (items to purchase)
+    - Access via order_items (reverse FK)
     - FK to GRN (link when goods received)
 
     STATUS FLOW:
@@ -1217,7 +1344,6 @@ class PurchaseOrder(models.Model):
     )
     order_date = models.DateField(default=timezone.now)
     expected_date = models.DateField(null=True, blank=True)
-    items = models.ManyToManyField('PurchaseOrderItem', related_name='po_items')
     sub_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
     discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
     grand_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
@@ -1287,7 +1413,7 @@ class PurchaseOrderItem(models.Model):
         blank=True,
         related_name='purchase_order_items'
     )
-    quantity_order = models.DecimalField(max_digits=12, decimal_places=4)
+    quantity_ordered = models.DecimalField(max_digits=12, decimal_places=4)
     quantity_received = models.DecimalField(max_digits=12, decimal_places=4, default=Decimal('0'))
     unit = models.ForeignKey(
         'stock.Unit',
@@ -1302,6 +1428,10 @@ class PurchaseOrderItem(models.Model):
     class Meta:
         verbose_name = 'Purchase Order Item'
         verbose_name_plural = 'Purchase Order Items'
+
+    def save(self, *args, **kwargs):
+        self.total = (self.quantity_ordered * self.rate) - self.discount
+        super().save(*args, **kwargs)
 
 
 class GoodReceiptNote(models.Model):
@@ -1318,7 +1448,7 @@ class GoodReceiptNote(models.Model):
     - FK to PurchaseOrder (optional link)
     - FK to Party (supplier)
     - FK to BusinessLocation
-    - M2M to GRNItem (received items)
+    - Access via grn_items (reverse FK)
 
     PO LINKING:
     - If PO provided, auto-fill items and expected quantities
@@ -1356,7 +1486,6 @@ class GoodReceiptNote(models.Model):
     received_date = models.DateField(default=timezone.now)
     supplier_invoice_number = models.CharField(max_length=50, blank=True)
     supplier_invoice_date = models.DateField(null=True, blank=True)
-    items = models.ManyToManyField('GRNItem', related_name='grn_items')
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(
@@ -1434,11 +1563,22 @@ class GRNItem(models.Model):
         blank=True
     )
     rate = models.DecimalField(max_digits=12, decimal_places=2)
+    batch = models.ForeignKey(
+        'stock.Batch',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='grn_items'
+    )
     total = models.DecimalField(max_digits=12, decimal_places=2)
 
     class Meta:
         verbose_name = 'GRN Item'
         verbose_name_plural = 'GRN Items'
+
+    def save(self, *args, **kwargs):
+        self.total = self.quantity * self.rate
+        super().save(*args, **kwargs)
 
 
 class PurchaseInvoice(models.Model):
@@ -1529,8 +1669,11 @@ class PurchaseInvoice(models.Model):
     round_off = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
     grand_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
 
-    is_finalized = models.BooleanField(default=False)
-    is_cancelled = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='Draft'
+    )
     notes = models.TextField(blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -1551,16 +1694,16 @@ class PurchaseInvoice(models.Model):
 
     def save(self, *args, **kwargs):
         if not self.invoice_number:
-            self.invoice_number = self.business_location.get_next_invoice_number()
+            self.invoice_number = self.business_location.get_next_purchase_invoice_number()
         super().save(*args, **kwargs)
 
     def finalize(self):
         """Finalize purchase invoice - add stock (Purchase type movement)."""
-        if self.is_finalized:
-            raise ValidationError("Already finalized")
+        if self.status != 'Draft':
+            raise ValidationError(f"Cannot finalize purchase invoice with status '{self.status}'")
 
-        self.is_finalized = True
-        self.save(update_fields=['is_finalized'])
+        self.status = 'Finalized'
+        self.save(update_fields=['status'])
 
         from stock.models import StockMovement
         for item in self.items.all():
@@ -1615,6 +1758,7 @@ class PurchaseInvoiceItem(models.Model):
     )
     rate = models.DecimalField(max_digits=12, decimal_places=2)
     discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'), blank=True)
     taxable_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
 
     cgst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
@@ -1623,12 +1767,42 @@ class PurchaseInvoiceItem(models.Model):
     sgst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
     igst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
     igst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    cess_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    cess_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
 
     total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
 
     class Meta:
         verbose_name = 'Purchase Invoice Item'
         verbose_name_plural = 'Purchase Invoice Items'
+
+    def save(self, *args, **kwargs):
+        self.calculate_totals()
+        super().save(*args, **kwargs)
+
+    def calculate_totals(self):
+        """Calculate tax amounts based on supplier state comparison."""
+        self.taxable_amount = (self.quantity * self.rate) - self.discount
+
+        if self.purchase_invoice.supplier.state_id == self.purchase_invoice.business_location.state_id:
+            self.cgst_rate = self.item.cgst_rate
+            self.sgst_rate = self.item.sgst_rate
+            self.igst_rate = Decimal('0')
+
+            self.cgst_amount = self.taxable_amount * self.cgst_rate / 100
+            self.sgst_amount = self.taxable_amount * self.sgst_rate / 100
+            self.igst_amount = Decimal('0')
+        else:
+            self.igst_rate = self.item.igst_rate
+            self.cgst_rate = Decimal('0')
+            self.sgst_rate = Decimal('0')
+
+            self.igst_amount = self.taxable_amount * self.igst_rate / 100
+            self.cgst_amount = Decimal('0')
+            self.sgst_amount = Decimal('0')
+
+        self.cess_amount = self.taxable_amount * self.cess_rate / 100
+        self.total = self.taxable_amount + self.cgst_amount + self.sgst_amount + self.igst_amount + self.cess_amount
 
 
 class DebitNote(models.Model):
@@ -1679,6 +1853,69 @@ class DebitNote(models.Model):
                 self.debit_note_number = f"{prefix}0001"
         super().save(*args, **kwargs)
 
+    def calculate_totals(self):
+        total = sum(item.refund_amount for item in self.items.all())
+        self.amount = total
+
+
+class DebitNoteItem(models.Model):
+    """
+    DebitNoteItem - Line Items in Debit Note
+    ============================================
+
+    Purpose: Individual items being returned in a debit note.
+
+    Fields:
+        debit_note (FK): Parent debit note
+        purchase_invoice_item (FK): Original purchase invoice item being returned
+        quantity_returned (Decimal): Quantity being returned (supports partial)
+        rate (Decimal): Rate captured at debit note creation
+        discount (Decimal): Line-level discount
+        taxable_amount (Decimal): (quantity × rate) - discount
+        cgst_rate, sgst_rate, igst_rate (Decimal): Tax rates snapshot
+        cgst_amount, sgst_amount, igst_amount (Decimal): Tax amounts
+        refund_amount (Decimal): Total refund for this line
+    """
+    debit_note = models.ForeignKey(
+        DebitNote,
+        on_delete=models.CASCADE,
+        related_name='items'
+    )
+    purchase_invoice_item = models.ForeignKey(
+        'PurchaseInvoiceItem',
+        on_delete=models.PROTECT,
+        related_name='debit_note_items'
+    )
+    quantity_returned = models.DecimalField(max_digits=12, decimal_places=4)
+    rate = models.DecimalField(max_digits=12, decimal_places=2)
+    discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    taxable_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    cgst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    cgst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    sgst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    sgst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    igst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    igst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    cess_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    cess_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    refund_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+
+    class Meta:
+        verbose_name = 'Debit Note Item'
+        verbose_name_plural = 'Debit Note Items'
+
+    def save(self, *args, **kwargs):
+        self.calculate_totals()
+        super().save(*args, **kwargs)
+
+    def calculate_totals(self):
+        self.taxable_amount = (self.quantity_returned * self.rate) - self.discount
+        self.cgst_amount = self.taxable_amount * self.cgst_rate / 100
+        self.sgst_amount = self.taxable_amount * self.sgst_rate / 100
+        self.igst_amount = self.taxable_amount * self.igst_rate / 100
+        self.cess_amount = self.taxable_amount * self.cess_rate / 100
+        self.refund_amount = self.taxable_amount + self.cgst_amount + self.sgst_amount + self.igst_amount + self.cess_amount
+
 
 class PaymentOut(models.Model):
     """
@@ -1687,14 +1924,9 @@ class PaymentOut(models.Model):
 
     Purpose:
     - Records payment against purchase invoice
-    - Updates supplier outstanding
+    - Uses PaymentOutAllocation for allocation tracking
     """
     payment_number = models.CharField(max_length=20, unique=True)
-    purchase_invoice = models.ForeignKey(
-        PurchaseInvoice,
-        on_delete=models.PROTECT,
-        related_name='payments'
-    )
     supplier = models.ForeignKey(
         Party,
         on_delete=models.PROTECT,

@@ -16,7 +16,7 @@ from .models import (
     Category, Unit, AttributeType, AttributeValue,
     TaxCode, TaxComponent,
     Item, ItemVariant, ItemVariantAttribute, Batch,
-    ItemImage, OpeningStock, StockMovement
+    ItemImage, OpeningStock, StockMovement, SerialNumber
 )
 
 
@@ -325,4 +325,12 @@ class StockMovementSerializer(serializers.ModelSerializer):
     """
     class Meta:
         model = StockMovement
+        fields = '__all__'
+
+
+class SerialNumberSerializer(serializers.ModelSerializer):
+    """Serializer for SerialNumber."""
+    
+    class Meta:
+        model = SerialNumber
         fields = '__all__'

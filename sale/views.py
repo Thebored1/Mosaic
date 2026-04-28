@@ -559,9 +559,9 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         """
         invoice = self.get_object()
 
-        if invoice.is_finalized:
+        if invoice.status != 'Draft':
             return Response(
-                {'error': 'Invoice already finalized'},
+                {'error': f'Cannot finalize invoice with status {invoice.status}'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -603,7 +603,7 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         """
         invoice = self.get_object()
 
-        if not invoice.is_finalized:
+        if invoice.status != 'Finalized':
             return Response(
                 {'error': 'Only finalized invoices can be cancelled'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -877,8 +877,8 @@ class PurchaseInvoiceViewSet(viewsets.ModelViewSet):
         """Finalize purchase invoice - add stock."""
         pi = self.get_object()
 
-        if pi.is_finalized:
-            return Response({'error': 'Already finalized'}, status=400)
+        if pi.status != 'Draft':
+            return Response({'error': f'Cannot finalize with status {pi.status}'}, status=400)
 
         try:
             pi.finalize()
@@ -891,10 +891,10 @@ class PurchaseInvoiceViewSet(viewsets.ModelViewSet):
         """Cancel purchase invoice."""
         pi = self.get_object()
 
-        if not pi.is_finalized:
+        if pi.status != 'Finalized':
             return Response({'error': 'Only finalized can be cancelled'}, status=400)
 
-        pi.is_cancelled = True
+        pi.status = 'Cancelled'
         pi.save()
         return Response({'message': 'Purchase invoice cancelled'})
 
@@ -1031,3 +1031,19 @@ class ReportsViewSet(viewsets.ViewSet):
                 })
 
         return Response({'gstr1_data': data})
+
+
+class QuotationViewSet(viewsets.ModelViewSet):
+    """ViewSet for Quotation CRUD."""
+    # TODO: Implement Quotation/QuotationItem models in sale/models.py
+    # from .models import Quotation, QuotationItem
+    # from .serializers import QuotationSerializer, QuotationDetailSerializer
+    pass
+
+
+class PriceListViewSet(viewsets.ModelViewSet):
+    """ViewSet for PriceList CRUD."""
+    # TODO: Implement PriceList/PriceListItem models in sale/models.py
+    # from .models import PriceList, PriceListItem
+    # from .serializers import PriceListSerializer, PriceListDetailSerializer
+    pass

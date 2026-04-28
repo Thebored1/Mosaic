@@ -877,3 +877,81 @@ class ApiConfiguration(models.Model):
 
     def __str__(self):
         return 'API Configuration'
+
+
+class SerialNumber(models.Model):
+    """
+    Serial Number / IMEI Tracking.
+    
+    Purpose: Track unique serial numbers for items (phones, electronics, etc.)
+    
+    Fields:
+        serial_number (str): Unique serial/IMEI number
+        status (str): Available/Sold/Return/Damaged/Lost
+        item (FK): Reference to Item
+        item_variant (FK): Reference to ItemVariant (optional)
+        batch (FK): Reference to Batch (optional)
+        warehouse (FK): Reference to Warehouse
+        purchase_date (date): When purchased
+        sale_date (date): When sold
+        warranty_expiry (date): Warranty expiration
+        notes (str): Notes
+    
+    API Endpoints:
+        GET/POST /v1/api/serial-numbers/
+        GET/PUT/DELETE /v1/api/serial-numbers/{id}/
+    
+    Filters:
+        ?status=Available
+        ?item=1
+        ?item_variant=1
+        ?warehouse=1
+    """
+    STATUS_CHOICES = [
+        ('Available', 'Available'),
+        ('Sold', 'Sold'),
+        ('Return', 'Return'),
+        ('Damaged', 'Damaged'),
+        ('Lost', 'Lost'),
+    ]
+
+    serial_number = models.CharField(max_length=100, unique=True)
+    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='Available')
+    item = models.ForeignKey(
+        'Item',
+        on_delete=models.PROTECT,
+        related_name='serial_numbers'
+    )
+    item_variant = models.ForeignKey(
+        'ItemVariant',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='serial_numbers'
+    )
+    batch = models.ForeignKey(
+        'Batch',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='serial_numbers'
+    )
+    warehouse = models.ForeignKey(
+        'configuration.Warehouse',
+        on_delete=models.PROTECT,
+        related_name='serial_numbers'
+    )
+    purchase_date = models.DateTimeField(null=True, blank=True)
+    sale_date = models.DateTimeField(null=True, blank=True)
+    warranty_expiry = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Serial Number'
+        verbose_name_plural = 'Serial Numbers'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return self.serial_number

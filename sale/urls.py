@@ -24,7 +24,9 @@ from .views import (
     PurchaseOrderViewSet, GoodReceiptNoteViewSet,
     PurchaseInvoiceViewSet, DebitNoteViewSet, PaymentOutViewSet,
     # Reports
-    ReportsViewSet
+    ReportsViewSet,
+    # Quotations & Price Lists (TODO: Implement models first)
+    # QuotationViewSet, PriceListViewSet
 )
 
 
@@ -134,6 +136,12 @@ router.register(r'payments-out', PaymentOutViewSet, basename='payments-out')
 # GET /sale/reports/gst-register/?start_date=2025-04-01&end_date=2025-04-30
 # GET /sale/reports/gstr1/?start_date=2025-04-01&end_date=2025-04-30
 router.register(r'reports', ReportsViewSet, basename='reports')
+
+# Quotations (TODO: Implement models first)
+# router.register(r'quotations', QuotationViewSet, basename='quotations')
+
+# Price Lists (TODO: Implement models first)
+# router.register(r'price-lists', PriceListViewSet, basename='price-lists')
 
 
 urlpatterns = [

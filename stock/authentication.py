@@ -1,7 +1,7 @@
 from rest_framework import authentication, permissions
 from rest_framework.exceptions import AuthenticationFailed
 from django.contrib.auth.models import AnonymousUser
-from .models import ApiConfiguration
+from configuration.models import ApiConfiguration
 
 
 class ApiKeyAuthentication(authentication.BaseAuthentication):
