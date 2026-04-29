@@ -13,8 +13,21 @@ ApiConfigurationViewSet - CRUD operations for ApiConfiguration model
 from rest_framework import viewsets, status, decorators
 from rest_framework.response import Response
 from django.db.models import Sum
-from .models import Warehouse, ApiConfiguration
-from .serializers import WarehouseSerializer, ApiConfigurationSerializer
+from .models import State, Warehouse, ApiConfiguration
+from .serializers import StateSerializer, WarehouseSerializer, ApiConfigurationSerializer
+
+
+class StateViewSet(viewsets.ReadOnlyModelViewSet):
+    """Indian States for GST."""
+    serializer_class = StateSerializer
+    filterset_fields = ['is_active']
+    search_fields = ['name', 'state_code']
+    ordering = ['name']
+
+    def get_queryset(self):
+        if not hasattr(self.request, 'auth') or self.request.auth is None:
+            return State.objects.none()
+        return State.objects.filter(organization=self.request.auth)
 
 
 class WarehouseViewSet(viewsets.ModelViewSet):
@@ -40,12 +53,16 @@ class WarehouseViewSet(viewsets.ModelViewSet):
         ?ordering=name - Order by name (default)
         ?ordering=code - Order by code
     """
-    queryset = Warehouse.objects.all()
     serializer_class = WarehouseSerializer
     filterset_fields = ['is_active', 'is_default']
     search_fields = ['name', 'code', 'gstin', 'legal_name']
     ordering_fields = ['name', 'code', 'created_at']
     ordering = ['name']
+
+    def get_queryset(self):
+        if not hasattr(self.request, 'auth') or self.request.auth is None:
+            return Warehouse.objects.none()
+        return Warehouse.objects.filter(organization=self.request.auth)
 
     @decorators.action(detail=True, methods=['post'])
     def set_default(self, request, pk=None):
@@ -70,50 +87,18 @@ class WarehouseViewSet(viewsets.ModelViewSet):
 
 
 class ApiConfigurationViewSet(viewsets.ModelViewSet):
-    """
-    ViewSet for API Configuration operations.
-    
-    Provides CRUD for API token configuration.
-    Due to singleton pattern, only one instance exists.
-    
-    Actions:
-        list - GET /api-config/ - Get current configuration
-        retrieve - GET /api-config/1/ - Get configuration details
-        partial_update - PATCH /api-config/1/ - Update token
-        update - PUT /api-config/1/ - Update configuration
-    
-    Note:
-        token value is hidden in responses for security.
-        Use PUT/PATCH with new token to regenerate.
-    """
-    queryset = ApiConfiguration.objects.all()
+    """API token configuration per organization."""
     serializer_class = ApiConfigurationSerializer
     
+    def get_queryset(self):
+        if not hasattr(self.request, 'auth') or self.request.auth is None:
+            return ApiConfiguration.objects.none()
+        return ApiConfiguration.objects.filter(organization=self.request.auth)
+    
     def get_object(self):
-        """Return singleton instance."""
-        obj, created = ApiConfiguration.objects.get_or_create(pk=1)
-        return obj
-    
-    def list(self, request, *args, **kwargs):
-        """Return singleton instead of list."""
-        return self.retrieve(request, *args, **kwargs)
-    
-    def create(self, request, *args, **kwargs):
-        """
-        Create or update configuration.
+        return self.get_object()
         
-        POST to this endpoint will update the existing singleton
-        rather than creating a new one.
-        """
-        return self.partial_update(request, *args, **kwargs)
-    
     def destroy(self, request, *args, **kwargs):
-        """
-        Prevent deletion of singleton.
-        
-        Returns:
-            405 Method Not Allowed
-        """
         return Response(
             {'detail': 'Cannot delete API configuration.'},
             status=status.HTTP_405_METHOD_NOT_ALLOWED

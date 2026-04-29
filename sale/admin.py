@@ -1,6 +1,6 @@
 from django.contrib import admin
 from .models import (
-    State, BusinessLocation, Party,
+    Party,
     Order, OrderItem,
     Invoice, InvoiceItem,
     CreditNote, Receipt,
@@ -9,19 +9,6 @@ from .models import (
     PurchaseInvoice, PurchaseInvoiceItem,
     DebitNote, PaymentOut
 )
-
-
-@admin.register(State)
-class StateAdmin(admin.ModelAdmin):
-    list_display = ['name', 'state_code', 'is_active']
-    search_fields = ['name', 'state_code']
-
-
-@admin.register(BusinessLocation)
-class BusinessLocationAdmin(admin.ModelAdmin):
-    list_display = ['legal_name', 'gstin', 'state', 'is_default', 'is_active']
-    list_filter = ['state', 'is_default', 'is_active']
-    search_fields = ['legal_name', 'gstin']
 
 
 @admin.register(Party)

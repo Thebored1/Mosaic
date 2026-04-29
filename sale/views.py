@@ -23,8 +23,9 @@ from django.db import transaction
 from django.utils import timezone
 from decimal import Decimal
 
+from configuration.models import State, Warehouse as BusinessLocation
 from .models import (
-    State, BusinessLocation, Party,
+    Party,
     Order, OrderItem,
     Invoice, InvoiceItem,
     CreditNote, Receipt,
@@ -51,6 +52,16 @@ class StandardPagination(PageNumberPagination):
     page_size = 10
     page_size_query_param = 'page_size'
     max_page_size = 100
+
+
+def org_filter(qs, request):
+    """Filter queryset by organization from auth token."""
+    if not hasattr(request, 'auth') or request.auth is None:
+        return qs.none()
+    # Check if model has organization field
+    if hasattr(qs.model, '_meta') and any(f.name == 'organization' for f in qs.model._meta.get_fields()):
+        return qs.filter(organization=request.auth)
+    return qs
 
 
 # ===================== MASTER DATA VIEWSETS =====================
@@ -81,6 +92,9 @@ class StateViewSet(viewsets.ReadOnlyModelViewSet):
     filter_backends = [SearchFilter]
     search_fields = ['name', 'state_code']
 
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
+
 
 class BusinessLocationViewSet(viewsets.ModelViewSet):
     """
@@ -98,8 +112,8 @@ class BusinessLocationViewSet(viewsets.ModelViewSet):
 
     Key Workflow:
     ┌─────────────────────────────────────────────────────────────────────┐
-    │  Creating a location:                                                │
-    │  1. POST with GSTIN, legal_name, state, address                    │
+    │  Creating a location:                                        │
+    │  1. POST with GSTIN, legal_name, state, address            │
     │  2. System validates GSTIN format                                   │
     │  3. Location created with sequence counter = 0                      │
     │  4. Use as default for: /sale/invoices/?business_location=1       │
@@ -122,6 +136,9 @@ class BusinessLocationViewSet(viewsets.ModelViewSet):
     search_fields = ['legal_name', 'trade_name', 'gstin']
     ordering_fields = ['legal_name', 'gstin']
     ordering = ['legal_name']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
 
 
 class PartyViewSet(viewsets.ModelViewSet):
@@ -303,6 +320,12 @@ class OrderViewSet(viewsets.ModelViewSet):
     search_fields = ['order_number', 'hold_notes']
     ordering_fields = ['created_at', 'order_number']
     ordering = ['-created_at']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -528,10 +551,13 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     queryset = Invoice.objects.all()
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ['party', 'business_location', 'billing_state', 'is_finalized', 'is_cancelled', 'invoice_type']
+    filterset_fields = ['party', 'business_location', 'billing_state', 'status', 'invoice_type']
     search_fields = ['invoice_number', 'party__name']
     ordering_fields = ['invoice_date', 'invoice_number', 'grand_total']
     ordering = ['-invoice_date', '-id']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -679,12 +705,16 @@ class ReceiptViewSet(viewsets.ModelViewSet):
     Payment Modes: Cash, Card, UPI, Bank Transfer, Credit
     """
     queryset = Receipt.objects.all()
+    serializer_class = ReceiptSerializer
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ['invoice', 'party', 'business_location', 'payment_mode']
-    search_fields = ['receipt_number', 'reference_number']
+    filterset_fields = ['party', 'payment_mode', 'business_location']
+    search_fields = ['receipt_number']
     ordering_fields = ['transaction_date', 'receipt_number']
     ordering = ['-transaction_date']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -710,13 +740,13 @@ class CreditNoteViewSet(viewsets.ModelViewSet):
     queryset = CreditNote.objects.all()
     serializer_class = CreditNoteSerializer
     pagination_class = StandardPagination
-    filter_backends = [DjangoFilterBackend, OrderingFilter]
-    filterset_fields = ['invoice', 'party', 'is_stock_returned']
-    ordering_fields = ['created_at']
-    ordering = ['-created_at']
+    filter_backends = [DjangoFilterBackend, SearchFilter]
+    filterset_fields = ['invoice', 'is_stock_returned']
+    search_fields = ['credit_note_number']
 
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
 
-# ===================== PURCHASE VIEWSETS =====================
 
 class PurchaseOrderViewSet(viewsets.ModelViewSet):
     """
@@ -761,6 +791,9 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     ordering_fields = ['order_date', 'po_number']
     ordering = ['-order_date']
 
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
+
     def get_serializer_class(self):
         if self.action == 'list':
             return PurchaseOrderListSerializer
@@ -801,6 +834,9 @@ class GoodReceiptNoteViewSet(viewsets.ModelViewSet):
     search_fields = ['grn_number', 'supplier_invoice_number']
     ordering_fields = ['received_date', 'grn_number']
     ordering = ['-received_date']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -862,10 +898,13 @@ class PurchaseInvoiceViewSet(viewsets.ModelViewSet):
     queryset = PurchaseInvoice.objects.all()
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ['supplier', 'business_location', 'is_finalized', 'is_cancelled']
+    filterset_fields = ['supplier', 'business_location', 'status']
     search_fields = ['invoice_number', 'supplier_invoice_number']
     ordering_fields = ['invoice_date', 'invoice_number']
     ordering = ['-invoice_date']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -908,6 +947,9 @@ class DebitNoteViewSet(viewsets.ModelViewSet):
     filterset_fields = ['purchase_invoice', 'supplier']
     ordering = ['-created_at']
 
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
+
 
 class PaymentOutViewSet(viewsets.ModelViewSet):
     """PaymentOut API - Payments to Suppliers"""
@@ -918,6 +960,9 @@ class PaymentOutViewSet(viewsets.ModelViewSet):
     filterset_fields = ['purchase_invoice', 'supplier', 'business_location']
     search_fields = ['payment_number', 'reference_number']
     ordering = ['-transaction_date']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
 
 
 # ===================== REPORTS =====================

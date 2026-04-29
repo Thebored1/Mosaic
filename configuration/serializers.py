@@ -11,7 +11,14 @@ ApiConfigurationSerializer - Serializer for ApiConfiguration model
 """
 
 from rest_framework import serializers
-from .models import Warehouse, ApiConfiguration
+from .models import State, Warehouse, ApiConfiguration
+
+
+class StateSerializer(serializers.ModelSerializer):
+    """Serializer for Indian States."""
+    class Meta:
+        model = State
+        fields = ['id', 'name', 'state_code', 'is_active']
 
 
 class WarehouseSerializer(serializers.ModelSerializer):
@@ -64,31 +71,7 @@ class WarehouseSerializer(serializers.ModelSerializer):
 
 
 class ApiConfigurationSerializer(serializers.ModelSerializer):
-    """
-    Serializer for ApiConfiguration model.
-    
-    Provides serialization for API token configuration.
-    Token is write-only on updates (never returned in responses).
-    """
-    
     class Meta:
         model = ApiConfiguration
-        fields = [
-            'id',
-            'api_bearer_token',
-            'is_active',
-            'created_at',
-            'updated_at',
-        ]
+        fields = ['id', 'api_bearer_token', 'is_active', 'created_at', 'updated_at']
         read_only_fields = ['created_at', 'updated_at']
-    
-    def to_representation(self, instance):
-        """
-        Hide token in responses for security.
-        
-        After any write operation, token is replaced with masked value.
-        """
-        data = super().to_representation(instance)
-        if data.get('api_bearer_token'):
-            data['api_bearer_token'] = '***HIDDEN***'
-        return data

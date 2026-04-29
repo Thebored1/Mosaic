@@ -377,7 +377,7 @@ class InvoiceListSerializer(serializers.ModelSerializer):
 
     Filtering:
     - By party: /sale/invoices/?party=1
-    - By status: /sale/invoices/?is_finalized=true
+    - By status: /sale/invoices/?status=Finalized
     - By date range: /sale/invoices/?invoice_date_after=2025-04-01
     - By location: /sale/invoices/?business_location=1
     """
@@ -392,7 +392,7 @@ class InvoiceListSerializer(serializers.ModelSerializer):
             'party', 'party_name', 'billing_state_name',
             'business_location', 'business_location_name',
             'sub_total', 'cgst_amount', 'sgst_amount', 'igst_amount',
-            'grand_total', 'is_finalized', 'is_cancelled'
+            'grand_total', 'status'
         ]
 
 

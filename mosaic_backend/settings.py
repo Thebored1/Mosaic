@@ -39,9 +39,9 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'django_filters',
+    'account',
     'stock',
     'sale',
-    'master',
     'configuration',
     'pos',
 ]
@@ -130,10 +130,10 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'stock.authentication.ApiKeyAuthentication',
+        'configuration.authentication.ApiKeyAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
-        'stock.authentication.ApiKeyPermission',
+        'configuration.authentication.ApiKeyPermission',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 10,

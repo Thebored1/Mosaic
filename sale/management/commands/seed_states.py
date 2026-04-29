@@ -1,5 +1,5 @@
 from django.core.management.base import BaseCommand
-from sale.models import State
+from configuration.models import State
 
 
 class Command(BaseCommand):
@@ -34,7 +34,7 @@ class Command(BaseCommand):
             ('25', 'Daman and Diu'),
             ('26', 'Dadra and Nagar Haveli'),
             ('27', 'Maharashtra'),
-            ('28', 'Andhra Pradesh (Old)'),
+            ('28', 'Andhra Pradesh'),
             ('29', 'Karnataka'),
             ('30', 'Goa'),
             ('31', 'Lakshadweep'),
@@ -43,14 +43,16 @@ class Command(BaseCommand):
             ('34', 'Puducherry'),
             ('35', 'Andaman and Nicobar Islands'),
             ('36', 'Telangana'),
-            ('37', 'Andhra Pradesh (New)'),
+            ('37', 'Andhra Pradesh'),
             ('38', 'Ladakh'),
         ]
 
         created = 0
         for code, name in states:
-            if not State.objects.filter(state_code=code).exists():
-                State.objects.create(name=name, state_code=code, is_active=True)
-                created += 1
+            State.objects.get_or_create(
+                state_code=code,
+                defaults={'name': name, 'is_active': True}
+            )
+            created += 1
 
         self.stdout.write(self.style.SUCCESS(f'Created {created} states'))

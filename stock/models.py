@@ -28,7 +28,21 @@ from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 
 
-class Category(models.Model):
+class OrganizationModel(models.Model):
+    """Abstract base model with organization FK for multi-tenancy."""
+    organization = models.ForeignKey(
+        'account.Organization',
+        on_delete=models.CASCADE,
+        related_name='%(class)s_set',
+        null=True,
+        blank=True
+    )
+
+    class Meta:
+        abstract = True
+
+
+class Category(OrganizationModel):
     """
     Categories items into logical groups.
     
@@ -65,7 +79,7 @@ class Category(models.Model):
         return self.name
 
 
-class Unit(models.Model):
+class Unit(OrganizationModel):
     """
     Measurement units for items with conversion support.
     
@@ -117,7 +131,7 @@ class Unit(models.Model):
         return self.name
 
 
-class AttributeType(models.Model):
+class AttributeType(OrganizationModel):
     """
     Custom attribute types for item variants.
     
@@ -145,7 +159,7 @@ class AttributeType(models.Model):
         return self.name
 
 
-class AttributeValue(models.Model):
+class AttributeValue(OrganizationModel):
     """
     Values for attribute types.
     
@@ -184,7 +198,7 @@ class AttributeValue(models.Model):
         return f'{self.attribute_type.name}: {self.value}'
 
 
-class TaxCode(models.Model):
+class TaxCode(OrganizationModel):
     """
     HSN/SAC tax codes for GST calculation.
     
@@ -242,7 +256,7 @@ class TaxCode(models.Model):
         return f'{self.code_type}: {self.code}'
 
 
-class TaxComponent(models.Model):
+class TaxComponent(OrganizationModel):
     """
     Individual tax components for a TaxCode.
     
@@ -304,7 +318,7 @@ def validate_stock(value):
         raise ValidationError('Stock cannot be negative')
 
 
-class Item(models.Model):
+class Item(OrganizationModel):
     """
     Main product/item master.
     
@@ -432,7 +446,7 @@ class Item(models.Model):
         return f'{self.name} ({self.sku})'
 
 
-class ItemVariant(models.Model):
+class ItemVariant(OrganizationModel):
     """
     Variants of an item (e.g., Red Large, Blue Small).
     
@@ -516,7 +530,7 @@ class ItemVariant(models.Model):
         return f'{self.item.name} - {self.sku}'
 
 
-class ItemVariantAttribute(models.Model):
+class ItemVariantAttribute(OrganizationModel):
     """
     Links ItemVariant to AttributeValue.
     
@@ -551,7 +565,7 @@ class ItemVariantAttribute(models.Model):
         return f'{self.item_variant.sku}: {self.attribute_value}'
 
 
-class Batch(models.Model):
+class Batch(OrganizationModel):
     """
     Inventory batch/lot tracking.
     
@@ -613,7 +627,7 @@ class Batch(models.Model):
         return f'{self.batch_number} - {self.item_variant.sku}'
 
 
-class ItemImage(models.Model):
+class ItemImage(OrganizationModel):
     """
     Product images with automatic WebP conversion.
     
@@ -688,7 +702,7 @@ class ItemImage(models.Model):
         super().save(*args, **kwargs)
 
 
-class OpeningStock(models.Model):
+class OpeningStock(OrganizationModel):
     """
     Initial stock entry for existing inventory.
     
@@ -750,7 +764,7 @@ class OpeningStock(models.Model):
         return f'Opening Stock - {self.item.sku}'
 
 
-class StockMovement(models.Model):
+class StockMovement(OrganizationModel):
     """
     Transaction history for inventory changes.
     
@@ -879,7 +893,7 @@ class ApiConfiguration(models.Model):
         return 'API Configuration'
 
 
-class SerialNumber(models.Model):
+class SerialNumber(OrganizationModel):
     """
     Serial Number / IMEI Tracking.
     

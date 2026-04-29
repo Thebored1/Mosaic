@@ -1,13 +1,12 @@
 """
 Configuration App Models
-========================
+=======================
 
-This module provides configuration models for business setup and multi-location management.
-
-Models:
--------
-Warehouse - Physical locations with GSTIN support for multi-state business operations
-ApiConfiguration - Singleton for API bearer token authentication
+This module provides configuration models for business setup:
+- Organization - Multi-tenant business entity
+- Warehouse - Physical locations with GSTIN
+- State - Indian states for GST
+- ApiConfiguration - Bearer token authentication
 """
 
 from django.db import models
@@ -15,7 +14,34 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 
-class Warehouse(models.Model):
+class OrganizationModel(models.Model):
+    """Abstract base model with organization FK for multi-tenancy."""
+    organization = models.ForeignKey(
+        'account.Organization',
+        on_delete=models.CASCADE,
+        related_name='%(class)s_set',
+        null=True,
+        blank=True
+    )
+
+    class Meta:
+        abstract = True
+
+
+class State(OrganizationModel):
+    """Indian State for GST Place of Supply."""
+    name = models.CharField(max_length=100)
+    state_code = models.CharField(max_length=2)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return f"{self.name} ({self.state_code})"
+
+
+class Warehouse(OrganizationModel):
     """
     Physical Warehouse/Business Location with GSTIN Support
     ========================================================
@@ -190,42 +216,16 @@ class Warehouse(models.Model):
 
 
 class ApiConfiguration(models.Model):
-    """
-    Singleton for API Bearer Token Configuration
-    =============================================
-    
-    Purpose:
-    - Stores bearer token for API authentication
-    - Enforces singleton pattern (only one row exists)
-    
-    Migration Note:
-    - This model replaces ApiConfiguration from the stock app
-    - Token data should be migrated to this model
-    
-    Singleton Behavior:
-    - save() forces pk=1 (only one row)
-    - Cannot add/delete via admin
-    - Admin redirects to edit page
-    
-    Authentication:
-    - Token passed in header: Authorization: Bearer <token>
-    - Validated in stock.authentication.ApiKeyAuthentication class
-    - Returns (AnonymousUser(), config) on success
-    
-    To regenerate token:
-        python manage.py create_api_config --regenerate
-    
-    API Access:
-        All /v1/*/ endpoints require valid Bearer token
-    """
-    api_bearer_token = models.CharField(
-        max_length=64,
-        help_text="Bearer token for API authentication"
+    """API Bearer Token per Organization."""
+    organization = models.OneToOneField(
+        'account.Organization',
+        on_delete=models.CASCADE,
+        related_name='api_configuration',
+        null=True,
+        blank=True
     )
-    is_active = models.BooleanField(
-        default=True,
-        help_text="Enable/disable API access"
-    )
+    api_bearer_token = models.CharField(max_length=64)
+    is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -233,14 +233,8 @@ class ApiConfiguration(models.Model):
         verbose_name = 'API Configuration'
         verbose_name_plural = 'API Configuration'
 
-    def save(self, *args, **kwargs):
-        """
-        Enforce singleton pattern.
-        
-        Always sets pk=1 to ensure only one configuration exists.
-        """
-        self.pk = 1
-        super().save(*args, **kwargs)
+    def __str__(self):
+        return f"API - {self.organization.name}"
 
     def delete(self, *args, **kwargs):
         """

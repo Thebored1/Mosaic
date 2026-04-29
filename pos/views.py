@@ -52,13 +52,10 @@ class ShiftViewSet(viewsets.ModelViewSet):
     ordering = ['-opening_time']
 
     def get_queryset(self):
-        """
-        Filter queryset by date if provided.
+        if not hasattr(self.request, 'auth') or self.request.auth is None:
+            return Shift.objects.none()
+        queryset = Shift.objects.filter(warehouse__organization=self.request.auth)
         
-        Query Params:
-            ?date=YYYY-MM-DD - Filter by date
-        """
-        queryset = super().get_queryset()
         date = self.request.query_params.get('date')
         if date:
             from django.utils import timezone
@@ -194,13 +191,11 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
     ordering = ['-created_at']
 
     def get_queryset(self):
-        """
-        Filter by shift if provided in URL.
-        
-        Supports nested routes:
-            /shifts/{shift_id}/transactions/
-        """
-        queryset = super().get_queryset()
+        if not hasattr(self.request, 'auth') or self.request.auth is None:
+            return CashTransaction.objects.none()
+        queryset = CashTransaction.objects.filter(
+            shift__warehouse__organization=self.request.auth
+        )
         shift_id = self.kwargs.get('shift_pk')
         if shift_id:
             queryset = queryset.filter(shift_id=shift_id)
