@@ -1,25 +1,16 @@
 """
-Stock Master Models
-===============
+Stock domain models.
 
-This module provides a complete inventory management system.
+This module defines the inventory master and audit structures used throughout
+the application:
 
-Model Overview:
-------------
-Category         - Groups items into categories (e.g., Electronics, Clothing)
-Unit            - Measurement units (e.g., pcs, kg, liters) with conversion support
-AttributeType   - Custom attribute types for variants (e.g., Color, Size)
-AttributeValue  - Values for attribute types (e.g., Red, Large)
-TaxCode         - HSN/SAC codes with tax rates
-TaxComponent    - CGST/SGST/IGST rates per TaxCode
-Item           - Main product/item master
-ItemVariant    - Variants of items (e.g., Red Large)
-ItemVariantAttribute - Links variant to attribute values
-ItemImage      - Product images with WebP conversion
-Batch          - Inventory batches/lots for tracking
-OpeningStock   - Initial stock entries (one-time)
-StockMovement  - Transaction history for stock changes
-ApiConfiguration - Singleton for API token
+1. master data such as categories, units, attributes, and tax codes
+2. item, variant, image, and batch records for catalog and stock control
+3. opening stock and stock movement audit trails
+4. serial-number tracking for individually traceable items
+
+The stock app is the inventory backbone for sale, commerce, POS, and purchase
+flows, so the models are explicit and strongly validated.
 """
 
 from decimal import Decimal
@@ -29,7 +20,12 @@ from django.core.files.base import ContentFile
 
 
 class OrganizationModel(models.Model):
-    """Abstract base model with organization FK for multi-tenancy."""
+    """
+    Abstract base model that adds organization scoping.
+
+    Most stock models inherit from this class so tenant ownership is enforced
+    consistently across inventory and reporting workflows.
+    """
     organization = models.ForeignKey(
         'account.Organization',
         on_delete=models.CASCADE,
@@ -850,47 +846,6 @@ class StockMovement(OrganizationModel):
 
     def __str__(self):
         return f'{self.movement_type} - {self.item.sku} - {self.quantity}'
-
-
-class ApiConfiguration(models.Model):
-    """
-    Singleton for API bearer token.
-    
-    Purpose: Stores token for API authentication.
-    
-    Fields:
-        api_bearer_token (str): Bearer token
-        is_active (bool): Enable/disable API access
-    
-    Singleton Behavior:
-        - save() forces pk=1 (only one row)
-        - Cannot add/delete via admin
-        - Admin redirects to edit page
-    
-    Authentication:
-        - Token passed in header: Authorization: Bearer <token>
-        - Validated in ApiKeyAuthentication class
-        - Returns (AnonymousUser(), config) on success
-    
-    To regenerate:
-        python manage.py create_api_config --regenerate
-    
-    API Access:
-        All /v1/api/ endpoints require valid Bearer token
-    """
-    api_bearer_token = models.CharField(max_length=64)
-    is_active = models.BooleanField(default=True)
-
-    class Meta:
-        verbose_name = 'API Configuration'
-        verbose_name_plural = 'API Configuration'
-
-    def save(self, *args, **kwargs):
-        self.pk = 1
-        super().save(*args, **kwargs)
-
-    def __str__(self):
-        return 'API Configuration'
 
 
 class SerialNumber(OrganizationModel):

@@ -3,8 +3,7 @@ from .models import (
     Category, Unit, AttributeType, AttributeValue,
     TaxCode, TaxComponent,
     Item, ItemVariant, ItemVariantAttribute, Batch,
-    ItemImage, OpeningStock, StockMovement,
-    ApiConfiguration
+    ItemImage, OpeningStock, StockMovement, SerialNumber
 )
 
 
@@ -98,16 +97,8 @@ class StockMovementAdmin(admin.ModelAdmin):
     search_fields = ('item__sku', 'reference_number')
 
 
-@admin.register(ApiConfiguration)
-class ApiConfigurationAdmin(admin.ModelAdmin):
-    def has_add_permission(self, request):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
-    def changelist_view(self, request, extra_context=None):
-        from django.shortcuts import redirect
-        return redirect('./1/change/')
-
-    list_display = ('api_bearer_token', 'is_active')
+@admin.register(SerialNumber)
+class SerialNumberAdmin(admin.ModelAdmin):
+    list_display = ('serial_number', 'item', 'item_variant', 'status', 'warehouse')
+    list_filter = ('status', 'warehouse')
+    search_fields = ('serial_number', 'item__name')

@@ -7,27 +7,60 @@ This module provides API views for configuration models.
 Views:
 ------
 WarehouseViewSet - CRUD operations for Warehouse model
-ApiConfigurationViewSet - CRUD operations for ApiConfiguration model
 """
 
-from rest_framework import viewsets, status, decorators
+from rest_framework import viewsets, decorators
 from rest_framework.response import Response
-from django.db.models import Sum
-from .models import State, Warehouse, ApiConfiguration
-from .serializers import StateSerializer, WarehouseSerializer, ApiConfigurationSerializer
+from rest_framework.exceptions import ValidationError
+from .models import State, Warehouse
+from .serializers import StateSerializer, WarehouseSerializer
+from configuration.authentication import SUPER_ADMIN_MARKER, ECOMMERCE_MARKER, ScopedRolePermission
+
+
+def org_filter(qs, request):
+    """Filter queryset by organization from auth token."""
+    if not hasattr(request, 'auth') or request.auth is None:
+        return qs.none()
+    if request.auth == ECOMMERCE_MARKER:
+        return qs.none()
+
+    if request.auth == SUPER_ADMIN_MARKER:
+        org_id = request.query_params.get('organization')
+        if org_id:
+            if hasattr(qs.model, '_meta') and any(f.name == 'organization' for f in qs.model._meta.get_fields()):
+                return qs.filter(organization_id=org_id)
+        return qs
+
+    if hasattr(qs.model, '_meta') and any(f.name == 'organization' for f in qs.model._meta.get_fields()):
+        return qs.filter(organization=request.auth)
+    return qs
+
+
+def save_for_request_organization(serializer, request):
+    org_id = request.data.get('organization') or request.query_params.get('organization')
+
+    if request.auth == SUPER_ADMIN_MARKER:
+        if not org_id:
+            raise ValidationError({'organization': 'organization is required for super admin writes'})
+        serializer.save(organization_id=org_id)
+        return
+    if request.auth == ECOMMERCE_MARKER:
+        raise ValidationError({'organization': 'Create or join an organization to access this feature'})
+
+    serializer.save(organization=request.auth)
 
 
 class StateViewSet(viewsets.ReadOnlyModelViewSet):
     """Indian States for GST."""
     serializer_class = StateSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'configuration_state'
     filterset_fields = ['is_active']
     search_fields = ['name', 'state_code']
     ordering = ['name']
 
     def get_queryset(self):
-        if not hasattr(self.request, 'auth') or self.request.auth is None:
-            return State.objects.none()
-        return State.objects.filter(organization=self.request.auth)
+        return org_filter(State.objects.all(), self.request)
 
 
 class WarehouseViewSet(viewsets.ModelViewSet):
@@ -54,15 +87,21 @@ class WarehouseViewSet(viewsets.ModelViewSet):
         ?ordering=code - Order by code
     """
     serializer_class = WarehouseSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'configuration_warehouse'
     filterset_fields = ['is_active', 'is_default']
     search_fields = ['name', 'code', 'gstin', 'legal_name']
     ordering_fields = ['name', 'code', 'created_at']
     ordering = ['name']
 
     def get_queryset(self):
-        if not hasattr(self.request, 'auth') or self.request.auth is None:
-            return Warehouse.objects.none()
-        return Warehouse.objects.filter(organization=self.request.auth)
+        return org_filter(Warehouse.objects.all(), self.request)
+
+    def perform_create(self, serializer):
+        save_for_request_organization(serializer, self.request)
+
+    def perform_update(self, serializer):
+        save_for_request_organization(serializer, self.request)
 
     @decorators.action(detail=True, methods=['post'])
     def set_default(self, request, pk=None):
@@ -84,22 +123,3 @@ class WarehouseViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(warehouse)
         return Response(serializer.data)
-
-
-class ApiConfigurationViewSet(viewsets.ModelViewSet):
-    """API token configuration per organization."""
-    serializer_class = ApiConfigurationSerializer
-    
-    def get_queryset(self):
-        if not hasattr(self.request, 'auth') or self.request.auth is None:
-            return ApiConfiguration.objects.none()
-        return ApiConfiguration.objects.filter(organization=self.request.auth)
-    
-    def get_object(self):
-        return self.get_object()
-        
-    def destroy(self, request, *args, **kwargs):
-        return Response(
-            {'detail': 'Cannot delete API configuration.'},
-            status=status.HTTP_405_METHOD_NOT_ALLOWED
-        )

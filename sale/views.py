@@ -1,21 +1,17 @@
 """
-Sale App Views - REST API Endpoints
-===================================
+Sale application views.
 
-This module provides API endpoints for all sale app operations.
-
-Each ViewSet includes documentation explaining:
-- Purpose and functionality
-- URL endpoints
-- Request/Response format
-- Interaction with other models/views
-- Key workflows
+This module exposes the back-office sales, purchase, and reporting APIs used
+by org users and super admins. The views here are the accounting backbone of
+the system, so they enforce tenant boundaries and document transitions
+carefully.
 """
 
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.db.models import Sum, Count, Q
@@ -24,6 +20,7 @@ from django.utils import timezone
 from decimal import Decimal
 
 from configuration.models import State, Warehouse as BusinessLocation
+from configuration.authentication import SUPER_ADMIN_MARKER, ECOMMERCE_MARKER, ScopedRolePermission
 from .models import (
     Party,
     Order, OrderItem,
@@ -48,46 +45,104 @@ from .serializers import (
 
 
 class StandardPagination(PageNumberPagination):
-    """Standard pagination for all list endpoints."""
+    """Standard pagination for sale endpoints."""
     page_size = 10
     page_size_query_param = 'page_size'
     max_page_size = 100
 
 
 def org_filter(qs, request):
-    """Filter queryset by organization from auth token."""
+    """Filter a queryset by the organization in the auth context."""
     if not hasattr(request, 'auth') or request.auth is None:
         return qs.none()
-    # Check if model has organization field
-    if hasattr(qs.model, '_meta') and any(f.name == 'organization' for f in qs.model._meta.get_fields()):
+    if request.auth == ECOMMERCE_MARKER:
+        return qs.none()
+
+    model_fields = {field.name for field in qs.model._meta.get_fields()}
+
+    if request.auth == SUPER_ADMIN_MARKER:
+        org_id = request.query_params.get('organization')
+        if not org_id:
+            return qs.none()
+
+        if 'organization' in model_fields:
+            return qs.filter(organization_id=org_id)
+        if 'business_location' in model_fields:
+            return qs.filter(business_location__organization_id=org_id)
+        if 'invoice' in model_fields:
+            return qs.filter(invoice__business_location__organization_id=org_id)
+        if 'purchase_invoice' in model_fields:
+            return qs.filter(purchase_invoice__business_location__organization_id=org_id)
+        return qs
+
+    if 'organization' in model_fields:
         return qs.filter(organization=request.auth)
-    return qs
+    if 'business_location' in model_fields:
+        return qs.filter(business_location__organization=request.auth)
+    if 'invoice' in model_fields:
+        return qs.filter(invoice__business_location__organization=request.auth)
+    if 'purchase_invoice' in model_fields:
+        return qs.filter(purchase_invoice__business_location__organization=request.auth)
+    if qs.model is State:
+        return qs
+    return qs.none()
+
+
+def save_for_request_organization(serializer, request):
+    """Save a model instance under the organization derived from the request."""
+    model_fields = {field.name for field in serializer.Meta.model._meta.get_fields()}
+    if 'organization' not in model_fields:
+        serializer.save()
+        return
+
+    org_id = request.data.get('organization') or request.query_params.get('organization')
+
+    if request.auth == SUPER_ADMIN_MARKER:
+        if not org_id:
+            raise ValidationError({'organization': 'organization is required for super admin writes'})
+        serializer.save(organization_id=org_id)
+        return
+    if request.auth == ECOMMERCE_MARKER:
+        raise ValidationError({'organization': 'Create or join an organization to access this feature'})
+
+    serializer.save(organization=request.auth)
+
+
+def validate_related_organization(request, **relations):
+    """Validate that related objects belong to the same organization."""
+    if request.auth == SUPER_ADMIN_MARKER:
+        return
+    if request.auth == ECOMMERCE_MARKER:
+        raise ValidationError({'organization': 'Create or join an organization to access this feature'})
+
+    for field_name, related_obj in relations.items():
+        if related_obj is None:
+            continue
+
+        related_org_id = getattr(related_obj, 'organization_id', None)
+        if related_org_id is None and hasattr(related_obj, 'business_location_id'):
+            business_location = getattr(related_obj, 'business_location', None)
+            related_org_id = getattr(business_location, 'organization_id', None)
+        if related_org_id is None and hasattr(related_obj, 'invoice_id'):
+            invoice = getattr(related_obj, 'invoice', None)
+            business_location = getattr(invoice, 'business_location', None)
+            related_org_id = getattr(business_location, 'organization_id', None)
+        if related_org_id is None and hasattr(related_obj, 'purchase_invoice_id'):
+            purchase_invoice = getattr(related_obj, 'purchase_invoice', None)
+            business_location = getattr(purchase_invoice, 'business_location', None)
+            related_org_id = getattr(business_location, 'organization_id', None)
+        if related_org_id is not None and related_org_id != request.auth.pk:
+            raise ValidationError({field_name: f'{field_name} does not belong to the authenticated organization'})
 
 
 # ===================== MASTER DATA VIEWSETS =====================
 
 class StateViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    State Master API
-    =================
-
-    Purpose: List all Indian states for GST place of supply selection
-
-    Endpoints:
-    - GET /sale/states/ - List all states
-    - GET /sale/states/{id}/ - Get state detail
-
-    Usage:
-    - Populated in invoice form (billing_state dropdown)
-    - Used by Party model (state field)
-    - Used by BusinessLocation model (state field)
-
-    GST Logic:
-    - Compare state_code from party vs business location
-    - Determine IGST (inter-state) vs CGST+SGST (intra-state)
-    """
+    """Read-only GST state master."""
     queryset = State.objects.filter(is_active=True)
     serializer_class = StateSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'sale_state'
     pagination_class = StandardPagination
     filter_backends = [SearchFilter]
     search_fields = ['name', 'state_code']
@@ -97,39 +152,11 @@ class StateViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class BusinessLocationViewSet(viewsets.ModelViewSet):
-    """
-    Business Location API - Multi-GSTIN Management
-    ===============================================
-
-    Purpose: Manage multiple GST registrations (branches/entities)
-
-    Endpoints:
-    - GET /sale/business-locations/ - List all locations
-    - POST /sale/business-locations/ - Create new location
-    - GET /sale/business-locations/{id}/ - Get location detail
-    - PUT /sale/business-locations/{id}/ - Update location
-    - DELETE /sale/business-locations/{id}/ - Delete location
-
-    Key Workflow:
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  Creating a location:                                        │
-    │  1. POST with GSTIN, legal_name, state, address            │
-    │  2. System validates GSTIN format                                   │
-    │  3. Location created with sequence counter = 0                      │
-    │  4. Use as default for: /sale/invoices/?business_location=1       │
-    │                                                                     │
-    │  Invoice Numbering per Location:                                   │
-    │  - Each location has separate invoice_sequence                     │
-    │  - Invoice number format: {GSTIN}/{FY}/{NNNNN}                     │
-    │  - Example: 27AAAAA0000A1Z5/2025-26/00001                          │
-    └─────────────────────────────────────────────────────────────────────┘
-
-    Filtering:
-    - Default location: /sale/business-locations/?is_default=true
-    - By state: /sale/business-locations/?state=1
-    """
+    """CRUD viewset for GST-registered business locations."""
     queryset = BusinessLocation.objects.all()
     serializer_class = BusinessLocationSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'sale_business_location'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['is_default', 'state', 'is_active']
@@ -140,47 +167,34 @@ class BusinessLocationViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return org_filter(self.queryset, self.request)
 
+    def perform_create(self, serializer):
+        save_for_request_organization(serializer, self.request)
+
+    def perform_update(self, serializer):
+        save_for_request_organization(serializer, self.request)
+
 
 class PartyViewSet(viewsets.ModelViewSet):
-    """
-    Party API - Customer & Supplier Master
-    =======================================
-
-    Purpose: Manage customers and suppliers with GST details
-
-    Endpoints:
-    - GET /sale/parties/ - List all parties
-    - POST /sale/parties/ - Create new party
-    - GET /sale/parties/{id}/ - Get party detail
-    - PUT /sale/parties/{id}/ - Update party
-    - DELETE /sale/parties/{id}/ - Deactivate party
-
-    Additional Actions:
-    - GET /sale/parties/{id}/ledger/ - Party ledger statement
-    - GET /sale/parties/{id}/outstanding/ - Current outstanding
-
-    Filtering:
-    - By type: /sale/parties/?party_type=Customer
-    - By state: /sale/parties/?state=1
-    - Active only: /sale/parties/?is_active=true
-
-    Credit Management Flow:
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  Credit Check on Invoice Finalize:                                 │
-    │  1. Invoice finalized for party                                    │
-    │  2. Check: party.outstanding + invoice.grand_total                 │
-    │  3. If > party.credit_limit: Warning/Block                        │
-    │  4. Allow if credit_limit = 0 (no limit)                          │
-    └─────────────────────────────────────────────────────────────────────┘
-    """
+    """CRUD viewset for the party master."""
     queryset = Party.objects.all()
     serializer_class = PartySerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'party_management'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['party_type', 'state', 'is_active']
     search_fields = ['name', 'gstin', 'phone', 'email']
     ordering_fields = ['name', 'party_type', 'created_at']
     ordering = ['name']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
+
+    def perform_create(self, serializer):
+        save_for_request_organization(serializer, self.request)
+
+    def perform_update(self, serializer):
+        save_for_request_organization(serializer, self.request)
 
     @action(detail=True, methods=['get'])
     def ledger(self, request, pk=None):
@@ -258,62 +272,11 @@ class PartyViewSet(viewsets.ModelViewSet):
 # ===================== ORDER VIEWSETS =====================
 
 class OrderViewSet(viewsets.ModelViewSet):
-    """
-    Order API - POS Cart & Hold Management
-    =======================================
-
-    Purpose: Handle POS orders with hold/recall functionality
-
-    Endpoints:
-    - GET /sale/orders/ - List all orders
-    - POST /sale/orders/ - Create new order (cart)
-    - GET /sale/orders/{id}/ - Get order detail
-    - PUT /sale/orders/{id}/ - Update order
-    - DELETE /sale/orders/{id}/ - Cancel/delete order
-
-    Custom Actions:
-    - POST /sale/orders/{id}/hold/ - Put order on hold
-    - POST /sale/orders/{id}/recall/ - Recall held order
-    - POST /sale/orders/{id}/convert/ - Convert to invoice
-
-    Workflow:
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  POS Billing Flow:                                                  │
-    │                                                                     │
-    │  1. Create Order: POST /sale/orders/                               │
-    │     {business_location: 1, party: 1, items: [...]}               │
-    │                                                                     │
-    │  2. Add Items: Items added via OrderCreateSerializer             │
-    │     - Auto-populated from stock.Item                              │
-    │     - Rate pulled from item.unit_price                            │
-    │     - Order.calculate_totals() called after each item             │
-    │                                                                     │
-    │  3. Hold: POST /sale/orders/{id}/hold/                            │
-    │     - status = 'Hold'                                             │
-    │     - hold_notes = "Customer name/phone"                          │
-    │     - Order freed for next customer                               │
-    │                                                                     │
-    │  4. Recall: GET /sale/orders/?status=Hold                        │
-    │     - POST /sale/orders/{id}/recall/                             │
-    │     - status = 'Billing'                                         │
-    │     - Continue billing                                             │
-    │                                                                     │
-    │  5. Convert: POST /sale/orders/{id}/convert/                     │
-    │     - Creates Invoice from Order                                  │
-    │     - Copies OrderItems to InvoiceItems                           │
-    │     - Calculates GST based on state                               │
-    │     - Updates Order.status = 'Invoiced'                          │
-    │     - Returns Invoice ID                                          │
-    └─────────────────────────────────────────────────────────────────────┘
-
-    Filtering:
-    - Active carts: /sale/orders/?status=Billing
-    - Held orders: /sale/orders/?status=Hold
-    - By location: /sale/orders/?business_location=1
-    - By party: /sale/orders/?party=1
-    """
+    """CRUD viewset for POS orders."""
     queryset = Order.objects.all()
     serializer_class = OrderSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'sales_operations'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['status', 'party', 'business_location']
@@ -324,18 +287,20 @@ class OrderViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return org_filter(self.queryset, self.request)
 
-    def get_queryset(self):
-        return org_filter(self.queryset, self.request)
-
     def get_serializer_class(self):
         if self.action == 'create':
             return OrderCreateSerializer
         return OrderSerializer
 
     def create(self, request, *args, **kwargs):
-        """Create new POS order with items."""
+        """Create a new POS order with nested items."""
         serializer = self.get_serializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
+        validate_related_organization(
+            request,
+            business_location=serializer.validated_data.get('business_location'),
+            party=serializer.validated_data.get('party'),
+        )
         order = serializer.save()
 
         return Response(
@@ -345,20 +310,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def hold(self, request, pk=None):
-        """
-        Hold Order
-        ==========
-
-        Purpose: Put current billing on hold
-
-        Request: POST /sale/orders/{id}/hold/
-
-        Payload: {"hold_notes": "Customer: John, Phone: 9876543210"}
-
-        Response: Order with status = 'Hold'
-
-        Usage: Customer steps away, next customer can be processed
-        """
+        """Put the current POS order on hold."""
         order = self.get_object()
         if order.status != 'Billing':
             return Response(
@@ -549,6 +501,8 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     - Search: /sale/invoices/?search=INV001
     """
     queryset = Invoice.objects.all()
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'sales_operations'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['party', 'business_location', 'billing_state', 'status', 'invoice_type']
@@ -565,6 +519,14 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         if self.action == 'create':
             return InvoiceCreateSerializer
         return InvoiceDetailSerializer
+
+    def perform_create(self, serializer):
+        validate_related_organization(
+            self.request,
+            business_location=serializer.validated_data.get('business_location'),
+            party=serializer.validated_data.get('party'),
+        )
+        serializer.save()
 
     @action(detail=True, methods=['post'])
     def finalize(self, request, pk=None):
@@ -685,27 +647,11 @@ class InvoiceViewSet(viewsets.ModelViewSet):
 
 
 class ReceiptViewSet(viewsets.ModelViewSet):
-    """
-    Receipt API - Payment Recording
-    ===============================
-
-    Purpose: Record payments received from customers
-
-    Endpoints:
-    - GET /sale/receipts/ - List all receipts
-    - POST /sale/receipts/ - Record new payment
-    - GET /sale/receipts/{id}/ - Get receipt detail
-    - DELETE /sale/receipts/{id}/ - Delete receipt
-
-    Filtering:
-    - By invoice: /sale/receipts/?invoice=1
-    - By party: /sale/receipts/?party=1
-    - By date: /sale/receipts/?transaction_date_after=2025-04-01
-
-    Payment Modes: Cash, Card, UPI, Bank Transfer, Credit
-    """
+    """CRUD viewset for customer receipts."""
     queryset = Receipt.objects.all()
     serializer_class = ReceiptSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'sales_operations'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['party', 'payment_mode', 'business_location']
@@ -722,23 +668,21 @@ class ReceiptViewSet(viewsets.ModelViewSet):
         return ReceiptSerializer
 
     def perform_create(self, serializer):
+        validate_related_organization(
+            self.request,
+            invoice=serializer.validated_data.get('invoice'),
+            party=serializer.validated_data.get('party'),
+            business_location=serializer.validated_data.get('business_location'),
+        )
         serializer.save(received_by=self.request.user)
 
 
 class CreditNoteViewSet(viewsets.ModelViewSet):
-    """
-    CreditNote API - Sales Returns
-    ===============================
-
-    Purpose: Manage sales returns / debit notes to customers
-
-    Endpoints:
-    - GET /sale/credit-notes/ - List all credit notes
-    - POST /sale/credit-notes/ - Create return
-    - GET /sale/credit-notes/{id}/ - Get detail
-    """
+    """CRUD viewset for sales credit notes."""
     queryset = CreditNote.objects.all()
     serializer_class = CreditNoteSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'sales_operations'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter]
     filterset_fields = ['invoice', 'is_stock_returned']
@@ -749,41 +693,10 @@ class CreditNoteViewSet(viewsets.ModelViewSet):
 
 
 class PurchaseOrderViewSet(viewsets.ModelViewSet):
-    """
-    Purchase Order API
-    ===================
-
-    Purpose: Create and manage purchase orders to suppliers
-
-    Endpoints:
-    - GET /sale/purchase-orders/ - List all POs
-    - POST /sale/purchase-orders/ - Create PO
-    - GET /sale/purchase-orders/{id}/ - Get PO detail
-    - PUT /sale/purchase-orders/{id}/ - Update PO
-    - DELETE /sale/purchase-orders/{id}/ - Delete PO
-
-    Actions:
-    - POST /sale/purchase-orders/{id}/send/ - Mark as sent to supplier
-
-    Workflow:
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  PO → GRN → Purchase Invoice Flow:                                │
-    │                                                                     │
-    │  1. Create PO: POST /sale/purchase-orders/                         │
-    │     {supplier, business_location, items: [...]}                   │
-    │     Status = 'Draft'                                               │
-    │                                                                     │
-    │  2. Send to Supplier: POST /sale/purchase-orders/{id}/send/       │
-    │     Status = 'Sent'                                                │
-    │                                                                     │
-    │  3. Goods Received: Create GRN (optional link to PO)              │
-    │     - PO.status = 'Partial' if partial, 'Received' if full        │
-    │                                                                     │
-    │  4. Bill Received: Create PurchaseInvoice linked to GRN          │
-    │     - PO.status = 'Received' (all goods invoiced)                 │
-    └─────────────────────────────────────────────────────────────────────┘
-    """
+    """CRUD viewset for purchase orders."""
     queryset = PurchaseOrder.objects.all()
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'purchase_operations'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['supplier', 'business_location', 'status']
@@ -799,6 +712,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             return PurchaseOrderListSerializer
         return PurchaseOrderDetailSerializer
 
+    def perform_create(self, serializer):
+        validate_related_organization(
+            self.request,
+            supplier=serializer.validated_data.get('supplier'),
+            business_location=serializer.validated_data.get('business_location'),
+        )
+        serializer.save()
+
     @action(detail=True, methods=['post'])
     def send(self, request, pk=None):
         """Mark PO as sent to supplier."""
@@ -809,25 +730,10 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
 
 class GoodReceiptNoteViewSet(viewsets.ModelViewSet):
-    """
-    GRN API - Good Receipt Note
-    ============================
-
-    Purpose: Record goods received from supplier
-
-    Endpoints:
-    - GET /sale/grns/ - List all GRNs
-    - POST /sale/grns/ - Create GRN
-    - GET /sale/grns/{id}/ - Get GRN detail
-
-    Actions:
-    - POST /sale/grns/{id}/create-invoice/ - Convert to purchase invoice
-
-    PO Linking:
-    - If linked to PO, auto-populate items
-    - Updates PO items quantity_received
-    """
+    """CRUD viewset for goods receipt notes."""
     queryset = GoodReceiptNote.objects.all()
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'purchase_operations'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['supplier', 'business_location', 'purchase_order']
@@ -842,6 +748,15 @@ class GoodReceiptNoteViewSet(viewsets.ModelViewSet):
         if self.action == 'list':
             return GRNListSerializer
         return GRNDetailSerializer
+
+    def perform_create(self, serializer):
+        validate_related_organization(
+            self.request,
+            supplier=serializer.validated_data.get('supplier'),
+            business_location=serializer.validated_data.get('business_location'),
+            purchase_order=serializer.validated_data.get('purchase_order'),
+        )
+        serializer.save()
 
     @action(detail=True, methods=['post'])
     def create_invoice(self, request, pk=None):
@@ -882,20 +797,10 @@ class GoodReceiptNoteViewSet(viewsets.ModelViewSet):
 
 
 class PurchaseInvoiceViewSet(viewsets.ModelViewSet):
-    """
-    Purchase Invoice API
-    ====================
-
-    Purpose: Manage supplier bills / purchase invoices
-
-    Endpoints:
-    - GET /sale/purchase-invoices/ - List all
-    - POST /sale/purchase-invoices/ - Create
-    - GET /sale/purchase-invoices/{id}/ - Get detail
-    - POST /sale/purchase-invoices/{id}/finalize/ - Finalize & add stock
-    - POST /sale/purchase-invoices/{id}/cancel/ - Cancel
-    """
+    """CRUD viewset for purchase invoices."""
     queryset = PurchaseInvoice.objects.all()
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'purchase_operations'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ['supplier', 'business_location', 'status']
@@ -910,6 +815,16 @@ class PurchaseInvoiceViewSet(viewsets.ModelViewSet):
         if self.action == 'list':
             return PurchaseInvoiceListSerializer
         return PurchaseInvoiceDetailSerializer
+
+    def perform_create(self, serializer):
+        validate_related_organization(
+            self.request,
+            supplier=serializer.validated_data.get('supplier'),
+            business_location=serializer.validated_data.get('business_location'),
+            grn=serializer.validated_data.get('grn'),
+            purchase_order=serializer.validated_data.get('purchase_order'),
+        )
+        serializer.save()
 
     @action(detail=True, methods=['post'])
     def finalize(self, request, pk=None):
@@ -939,9 +854,11 @@ class PurchaseInvoiceViewSet(viewsets.ModelViewSet):
 
 
 class DebitNoteViewSet(viewsets.ModelViewSet):
-    """DebitNote API - Purchase Returns"""
+    """CRUD viewset for debit notes used in purchase returns."""
     queryset = DebitNote.objects.all()
     serializer_class = DebitNoteSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'purchase_operations'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, OrderingFilter]
     filterset_fields = ['purchase_invoice', 'supplier']
@@ -952,9 +869,11 @@ class DebitNoteViewSet(viewsets.ModelViewSet):
 
 
 class PaymentOutViewSet(viewsets.ModelViewSet):
-    """PaymentOut API - Payments to Suppliers"""
+    """CRUD viewset for payments made to suppliers."""
     queryset = PaymentOut.objects.all()
     serializer_class = PaymentOutSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'purchase_operations'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter]
     filterset_fields = ['purchase_invoice', 'supplier', 'business_location']
@@ -964,41 +883,42 @@ class PaymentOutViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return org_filter(self.queryset, self.request)
 
+    def perform_create(self, serializer):
+        validate_related_organization(
+            self.request,
+            supplier=serializer.validated_data.get('supplier'),
+            business_location=serializer.validated_data.get('business_location'),
+            purchase_invoice=serializer.validated_data.get('purchase_invoice'),
+        )
+        serializer.save()
+
 
 # ===================== REPORTS =====================
 
 class ReportsViewSet(viewsets.ViewSet):
-    """
-    Reports API
-    ===========
+    """Reporting viewset for operational and GST summaries."""
 
-    Purpose: Generate business reports
-
-    Endpoints:
-    - GET /sale/reports/daily-sales/ - Daily sales summary
-    - GET /sale/reports/gst-register/ - GST sales register
-    - GET /sale/reports/gstr1/ - GSTR-1 format data
-    - GET /sale/reports/purchase-register/ - Purchase register
-    """
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'reporting'
 
     @action(detail=False, methods=['get'])
     def daily_sales(self, request):
         """Daily sales summary."""
         date = request.query_params.get('date', timezone.now().date())
 
-        invoices = Invoice.objects.filter(
+        invoices = org_filter(Invoice.objects.filter(
             invoice_date__date=date,
             is_finalized=True,
             is_cancelled=False
-        ).aggregate(
+        ), request).aggregate(
             total_sales=Sum('grand_total'),
             total_tax=Sum('cgst_amount') + Sum('sgst_amount') + Sum('igst_amount'),
             total_items=Count('id')
         )
 
-        receipts = Receipt.objects.filter(
+        receipts = org_filter(Receipt.objects.filter(
             transaction_date__date=date
-        ).aggregate(
+        ), request).aggregate(
             total_receipts=Sum('amount')
         )
 
@@ -1016,10 +936,10 @@ class ReportsViewSet(viewsets.ViewSet):
         start_date = request.query_params.get('start_date')
         end_date = request.query_params.get('end_date')
 
-        invoices = Invoice.objects.filter(
+        invoices = org_filter(Invoice.objects.filter(
             is_finalized=True,
             is_cancelled=False
-        )
+        ), request)
 
         if start_date:
             invoices = invoices.filter(invoice_date__date__gte=start_date)
@@ -1043,11 +963,11 @@ class ReportsViewSet(viewsets.ViewSet):
         start_date = request.query_params.get('start_date')
         end_date = request.query_params.get('end_date')
 
-        invoices = Invoice.objects.filter(
+        invoices = org_filter(Invoice.objects.filter(
             is_finalized=True,
             is_cancelled=False,
             invoice_type__in=['Tax Invoice', 'Export', 'SEZ']
-        )
+        ), request)
 
         if start_date:
             invoices = invoices.filter(invoice_date__date__gte=start_date)
@@ -1079,7 +999,7 @@ class ReportsViewSet(viewsets.ViewSet):
 
 
 class QuotationViewSet(viewsets.ModelViewSet):
-    """ViewSet for Quotation CRUD."""
+    """Placeholder viewset for quotation CRUD."""
     # TODO: Implement Quotation/QuotationItem models in sale/models.py
     # from .models import Quotation, QuotationItem
     # from .serializers import QuotationSerializer, QuotationDetailSerializer
@@ -1087,7 +1007,7 @@ class QuotationViewSet(viewsets.ModelViewSet):
 
 
 class PriceListViewSet(viewsets.ModelViewSet):
-    """ViewSet for PriceList CRUD."""
+    """Placeholder viewset for price list CRUD."""
     # TODO: Implement PriceList/PriceListItem models in sale/models.py
     # from .models import PriceList, PriceListItem
     # from .serializers import PriceListSerializer, PriceListDetailSerializer

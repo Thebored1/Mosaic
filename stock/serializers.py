@@ -1,14 +1,17 @@
 """
-Stock Master Serializers
-=====================
+Stock master serializers.
 
-DRF serializers for API endpoints.
-Each serializer maps models to JSON.
+These serializers define the public stock API contract for the inventory
+management layer:
 
-Key Features:
-- Nested serializers for related data
-- Automatic tax rate snapshot on item creation
-- Read-only nested data in list views
+1. master data such as categories, units, attributes, and tax codes
+2. item detail payloads with nested variants and images
+3. batch, opening stock, movement, and serial tracking records
+4. read-only nested summaries for browse-heavy endpoints
+
+The serializer layer is intentionally explicit because the stock app is used
+both by admin screens and by other business workflows such as sale and
+commerce.
 """
 
 from rest_framework import serializers
@@ -22,13 +25,10 @@ from .models import (
 
 class CategorySerializer(serializers.ModelSerializer):
     """
-    Serializer for Category model.
-    
-    Endpoints:
-        GET/POST /v1/api/categories/
-        GET/PUT/DELETE /v1/api/categories/{id}/
-    
-    Fields: id, name, description, is_active
+    Serialize inventory categories.
+
+    Categories are simple master records, so the serializer keeps the payload
+    flat and mirrors the model closely.
     """
     class Meta:
         model = Category
@@ -37,16 +37,10 @@ class CategorySerializer(serializers.ModelSerializer):
 
 class UnitSerializer(serializers.ModelSerializer):
     """
-    Serializer for Unit model.
-    
-    Endpoints:
-        GET/POST /v1/api/units/
-        GET/PUT/DELETE /v1/api/units/{id}/
-    
-    Fields: id, name, short_code, target_unit, conversion_factor, 
-            must_be_whole_number, is_active
-    
-    Nested: target_unit (read only)
+    Serialize measurement units.
+
+    Units participate in stock conversion and whole-number validation, so the
+    serializer exposes both the base unit fields and the conversion metadata.
     """
     class Meta:
         model = Unit
@@ -55,13 +49,10 @@ class UnitSerializer(serializers.ModelSerializer):
 
 class AttributeTypeSerializer(serializers.ModelSerializer):
     """
-    Serializer for AttributeType model.
-    
-    Endpoints:
-        GET/POST /v1/api/attribute-types/
-        GET/PUT/DELETE /v1/api/attribute-types/{id}/
-    
-    Fields: id, name, description
+    Serialize item attribute types.
+
+    Attribute types are used to describe variant dimensions such as color,
+    size, or other catalog-specific attributes.
     """
     class Meta:
         model = AttributeType
@@ -70,17 +61,10 @@ class AttributeTypeSerializer(serializers.ModelSerializer):
 
 class AttributeValueSerializer(serializers.ModelSerializer):
     """
-    Serializer for AttributeValue model.
-    
-    Endpoints:
-        GET/POST /v1/api/attribute-values/
-        GET/PUT/DELETE /v1/api/attribute-values/{id}/
-    
-    Fields: id, attribute_type, value
-    
-    Nested: attribute_type (read only)
-    
-    Filters: ?attribute_type=1
+    Serialize concrete attribute values.
+
+    Values are linked to an attribute type and later assigned to item variants
+    to define a sellable combination.
     """
     class Meta:
         model = AttributeValue
@@ -89,17 +73,10 @@ class AttributeValueSerializer(serializers.ModelSerializer):
 
 class TaxComponentSerializer(serializers.ModelSerializer):
     """
-    Serializer for TaxComponent model.
-    
-    Endpoints:
-        GET/POST /v1/api/tax-components/
-        GET/PUT/DELETE /v1/api/tax-components/{id}/
-    
-    Fields: id, tax_code, component, rate
-    
-    Nested: tax_code (read only)
-    
-    Filters: ?tax_code=1, ?component=CGST
+    Serialize the component-level tax breakdown.
+
+    Tax components let the frontend and reporting layers show the GST split
+    behind each HSN/SAC tax code.
     """
     class Meta:
         model = TaxComponent
@@ -108,24 +85,10 @@ class TaxComponentSerializer(serializers.ModelSerializer):
 
 class TaxCodeSerializer(serializers.ModelSerializer):
     """
-    Serializer for TaxCode with nested components.
-    
-    Endpoints:
-        GET/POST /v1/api/tax-codes/
-        GET/PUT/DELETE /v1/api/tax-codes/{id}/
-    
-    Fields: id, name, code_type, code, is_exempt, is_active, components
-    
-    Nested: components (list of TaxComponent)
-    
-    How Tax Rates Work with Items:
-        When Item is created with tax_code:
-        1. Serializer looks up TaxCode.components
-        2. Extracts CGST, SGST, IGST rates
-        3. Saves to Item.cgst_rate, sgst_rate, igst_rate
-        4. These values persist even if TaxCode changes
-    
-    Filters: ?is_active=true, ?is_exempt=true, ?code_type=HSN
+    Serialize tax codes with nested components.
+
+    Item creation snapshots these tax components into the item master so later
+    tax code edits do not rewrite historical inventory records.
     """
     components = TaxComponentSerializer(many=True, read_only=True)
 
@@ -136,13 +99,10 @@ class TaxCodeSerializer(serializers.ModelSerializer):
 
 class ItemVariantAttributeSerializer(serializers.ModelSerializer):
     """
-    Serializer for ItemVariantAttribute.
-    
-    Endpoints: Via nested under item variants
-    
-    Fields: id, item_variant, attribute_value
-    
-    Nested: attribute_value (read only)
+    Serialize the link between a variant and an attribute value.
+
+    This serializer is usually used in nested variant payloads where the
+    frontend is building or reading a complete SKU definition.
     """
     class Meta:
         model = ItemVariantAttribute
@@ -151,17 +111,10 @@ class ItemVariantAttributeSerializer(serializers.ModelSerializer):
 
 class ItemVariantSerializer(serializers.ModelSerializer):
     """
-    Serializer for ItemVariant with nested attributes.
-    
-    Endpoints:
-        GET/POST /v1/api/items/{id}/variants/
-        GET/PUT/DELETE /v1/api/items/{id}/variants/{id}/
-    
-    Fields: id, item, sku, unit_price, cost_price, current_stock, is_active, attributes
-    
-    Nested: attributes (list of ItemVariantAttribute)
-    
-    Note: item is read-only in nested context, write only in full list
+    Serialize an item variant with nested attributes.
+
+    Variants are the inventory unit sold when an item has multiple SKUs for
+    size, color, or other attribute combinations.
     """
     attributes = ItemVariantAttributeSerializer(many=True, read_only=True)
 
@@ -172,17 +125,10 @@ class ItemVariantSerializer(serializers.ModelSerializer):
 
 class ItemImageSerializer(serializers.ModelSerializer):
     """
-    Serializer for ItemImage.
-    
-    Endpoints:
-        GET/POST /v1/api/items/{id}/images/
-        GET/PUT/DELETE /v1/api/items/{id}/images/{id}/
-    
-    Fields: id, item, item_variant, image, is_primary, display_order
-    
-    WebP Conversion:
-        - Happens automatically on model save
-        - Non-WebP images converted to WebP format
+    Serialize product images.
+
+    Images can belong to either the parent item or a specific variant, letting
+    the frontend render both general catalog views and variant-specific views.
     """
     class Meta:
         model = ItemImage
@@ -191,22 +137,10 @@ class ItemImageSerializer(serializers.ModelSerializer):
 
 class ItemListSerializer(serializers.ModelSerializer):
     """
-    Serializer for Item list view.
-    
-    Used when listing items (not detailed view).
-    
-    Endpoints:
-        GET /v1/api/items/
-    
-    Fields: id, name, sku, description, category, unit, tax_code,
-            cgst_rate, sgst_rate, igst_rate, has_variants, current_stock,
-            min_stock_level, max_stock_level, unit_price, cost_price,
-            is_active, created_at, updated_at
-    
-    Nested (read only): category, unit, tax_code (with components)
-    
-    Filters: ?is_active=true, ?category=1, ?unit=1, ?has_variants=true
-    Search: ?search=query (name, sku, description)
+    Serialize inventory items for list views.
+
+    The list serializer stays compact while still surfacing the inventory and
+    tax metadata needed by browse screens and selection dialogs.
     """
     category = CategorySerializer(read_only=True)
     unit = UnitSerializer(read_only=True)
@@ -225,24 +159,10 @@ class ItemListSerializer(serializers.ModelSerializer):
 
 class ItemDetailSerializer(serializers.ModelSerializer):
     """
-    Serializer for Item detail view.
-    
-    Used when retrieving single item.
-    
-    Endpoints:
-        GET /v1/api/items/{id}/
-        POST /v1/api/items/
-        PUT /v1/api/items/{id}/
-    
-    Fields: All Item fields + nested variants and images
-    
-    Nested (read only): category, unit, tax_code, variants, images
-    
-    Tax Rate Snapshot:
-        On create/update with tax_code:
-        - Serializer captures current TaxComponent rates
-        - Saves to cgst_rate, sgst_rate, igst_rate
-        - Rates persist independent of TaxCode changes
+    Serialize a full inventory item detail payload.
+
+    The detail view includes nested variants and images so the frontend can
+    render a complete product management or buyer-facing catalog screen.
     """
     category = CategorySerializer(read_only=True)
     unit = UnitSerializer(read_only=True)
@@ -257,20 +177,10 @@ class ItemDetailSerializer(serializers.ModelSerializer):
 
 class BatchSerializer(serializers.ModelSerializer):
     """
-    Serializer for Batch model.
-    
-    Endpoints:
-        GET/POST /v1/api/batches/
-        GET/PUT/DELETE /v1/api/batches/{id}/
-    
-    Fields: id, batch_number, item_variant, quantity_received,
-            quantity_remaining, cost_per_unit, received_date, expiry_date
-    
-    Nested: item_variant (read only)
-    
-    Filters: ?item_variant=1
-    
-    Usage: Tracks inventory by lot for FIFO/LIFO costing
+    Serialize inventory batches.
+
+    Batches track lot-level quantities and costs for FIFO/LIFO-aware inventory
+    workflows.
     """
     class Meta:
         model = Batch
@@ -279,21 +189,10 @@ class BatchSerializer(serializers.ModelSerializer):
 
 class OpeningStockSerializer(serializers.ModelSerializer):
     """
-    Serializer for OpeningStock model.
-    
-    Endpoints:
-        GET/POST /v1/api/opening-stock/
-        GET/PUT/DELETE /v1/api/opening-stock/{id}/
-    
-    Fields: id, item, item_variant, quantity, unit_cost, as_of_date,
-            notes, status, created_at, updated_at
-    
-    Workflow:
-        1. Create with status=Pending
-        2. Admin approves -> updates stock
-        3. One-time use
-    
-    Filters: ?status=Pending, ?item=1
+    Serialize opening stock entries.
+
+    Opening stock is typically used once during migration or initial setup and
+    then approved into the live inventory totals.
     """
     class Meta:
         model = OpeningStock
@@ -302,26 +201,10 @@ class OpeningStockSerializer(serializers.ModelSerializer):
 
 class StockMovementSerializer(serializers.ModelSerializer):
     """
-    Serializer for StockMovement model.
-    
-    Endpoints:
-        GET/POST /v1/api/stock-movements/
-        GET/PUT/DELETE /v1/api/stock-movements/{id}/
-    
-    Fields: id, movement_type, item, item_variant, batch, quantity,
-            rate, cgst_rate, sgst_rate, igst_rate, total_amount,
-            reference_number, movement_date, status, notes,
-            created_at, updated_at
-    
-    Tax Snapshot:
-        Rates captured at creation time for historical accuracy
-    
-    Workflow:
-        1. Create with status=Pending
-        2. Admin approves -> updates stock
-        3. If batch linked, decrements batch quantity
-    
-    Filters: ?status=Pending, ?movement_type=Purchase, ?item=1
+    Serialize stock movements.
+
+    Stock movements are the audit trail for inventory changes and capture the
+    quantity, rate, and tax snapshot at the time the movement was recorded.
     """
     class Meta:
         model = StockMovement
@@ -329,7 +212,12 @@ class StockMovementSerializer(serializers.ModelSerializer):
 
 
 class SerialNumberSerializer(serializers.ModelSerializer):
-    """Serializer for SerialNumber."""
+    """
+    Serialize serial-number tracked inventory.
+
+    Serial numbers are used for individually traceable items such as phones or
+    other high-value stock.
+    """
     
     class Meta:
         model = SerialNumber

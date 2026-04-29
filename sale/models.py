@@ -1,19 +1,16 @@
 """
-Sale App Models - Indian GST Compliant POS & Purchase Management
-================================================================
+Sale domain models.
 
-This module provides models for:
-1. Party Management (Customers & Suppliers)
-2. Sales Invoicing (POS, Retail, B2B, Export)
-3. Purchase Management (PO, GRN, Purchase Invoice)
-4. Payments & Returns
-5. Multi-GSTIN Business Locations
+This module defines the accounting and transactional backbone of the system:
 
-Each model includes detailed documentation explaining:
-- Purpose and business function
-- Key fields and their significance
-- How it interacts with other models
-- GST compliance considerations
+1. party masters for customers and suppliers
+2. POS orders and hold/recall workflows
+3. sales invoices and GST-aware tax calculation
+4. purchase orders, GRNs, purchase invoices, debit notes, and payments
+5. business location anchored numbering and place-of-supply behavior
+
+The sale app remains the back-office ERP layer behind commerce and POS, so the
+models carry the tax and accounting state needed by those workflows.
 """
 
 from decimal import Decimal
@@ -22,142 +19,6 @@ from django.db.models import F
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 from django.contrib.auth.models import User
-
-
-class State(models.Model):
-    """
-    State Master - Required for GST Place of Supply determination.
-
-    Interaction:
-    - Used by Party (billing_state, shipping_state)
-    - Used by BusinessLocation (state)
-    - Used by Invoice (billing_state) for IGST/CGST+SGST determination
-    - Used by PurchaseInvoice (supplier_state) for ITC calculation
-
-    GST Logic:
-    - If billing_state == business_location.state → Intra-state (CGST+SGST)
-    - If billing_state != business_location.state → Inter-state (IGST)
-    """
-    name = models.CharField(max_length=100, unique=True)
-    state_code = models.CharField(max_length=2, unique=True, help_text="GST state code (e.g., 27 for Maharashtra)")
-    is_active = models.BooleanField(default=True)
-
-    class Meta:
-        verbose_name = 'State'
-        verbose_name_plural = 'States'
-        ordering = ['name']
-
-    def __str__(self):
-        return f"{self.name} ({self.state_code})"
-
-
-class BusinessLocation(models.Model):
-    """
-    Business Location - Multi-GSTIN Support for Multiple Branches/States
-    =========================================================================
-
-    Purpose:
-    - Manages multiple GST registrations under one business
-    - Each location generates separate invoice series
-    - Required for businesses with multiple branches or operating in different states
-
-    Interaction:
-    - FK in Invoice (for multi-location invoice numbering)
-    - FK in PurchaseInvoice (for multi-location purchase tracking)
-    - FK in Order (to track which location created the order)
-    - FK in Receipt/PaymentOut (to track payments per location)
-
-    Invoice Numbering Logic:
-    - Format: {GSTIN}/{Financial Year}/{Sequential Number}
-    - Example: 27AAAAA0000A1Z5/2025-26/00001
-    - Each business_location has its own sequence counter
-    - When creating invoice, the location determines the prefix
-
-    Endpoint Interaction:
-    - GET/POST /sale/business-locations/ - List/Create locations
-    - Invoice creation automatically uses location's GSTIN for numbering
-    """
-    gstin = models.CharField(
-        max_length=15,
-        unique=True,
-        help_text="Valid 15-character GSTIN (e.g., 27AAAAA0000A1Z5)"
-    )
-    legal_name = models.CharField(
-        max_length=200,
-        help_text="Legal name as per GST registration"
-    )
-    trade_name = models.CharField(
-        max_length=200,
-        blank=True,
-        help_text="Trading name (if different from legal name)"
-    )
-    state = models.ForeignKey(
-        State,
-        on_delete=models.PROTECT,
-        related_name='business_locations',
-        help_text="State of registration for GST purposes"
-    )
-    address = models.TextField(help_text="Complete registered address")
-    phone = models.CharField(max_length=20, blank=True)
-    email = models.EmailField(blank=True)
-    invoice_sequence = models.PositiveIntegerField(
-        default=0,
-        help_text="Current invoice number sequence for this location"
-    )
-    purchase_invoice_sequence = models.PositiveIntegerField(
-        default=0,
-        help_text="Current purchase invoice sequence"
-    )
-    is_default = models.BooleanField(
-        default=False,
-        help_text="Default location for new transactions if no location selected"
-    )
-    is_active = models.BooleanField(default=True)
-
-    class Meta:
-        verbose_name = 'Business Location'
-        verbose_name_plural = 'Business Locations'
-        ordering = ['legal_name']
-
-    def __str__(self):
-        return f"{self.trade_name or self.legal_name} ({self.gstin})"
-
-    def get_next_invoice_number(self):
-        """Generate next invoice number with race condition protection."""
-        BusinessLocation.objects.filter(pk=self.pk).update(
-            invoice_sequence=F('invoice_sequence') + 1
-        )
-        self.refresh_from_db()
-        fy = self.get_current_financial_year()
-        return f"{self.gstin}/{fy}/{self.invoice_sequence:05d}"
-
-    def get_current_financial_year(self):
-        today = timezone.now().date()
-        if today.month >= 4:
-            return f"{today.year}-{today.year + 1}"
-        return f"{today.year - 1}-{today.year}"
-
-    def get_next_purchase_invoice_number(self):
-        """Generate next purchase invoice number with race condition protection."""
-        BusinessLocation.objects.filter(pk=self.pk).update(
-            purchase_invoice_sequence=F('purchase_invoice_sequence') + 1
-        )
-        self.refresh_from_db()
-        fy = self.get_current_financial_year()
-        return f"{self.gstin}/PI/{fy}/{self.purchase_invoice_sequence:05d}"
-
-    def clean(self):
-        super().clean()
-        if self.gstin:
-            self.gstin = self.gstin.upper()
-            if len(self.gstin) != 15:
-                raise ValidationError({'gstin': 'GSTIN must be exactly 15 characters'})
-            if not self.gstin[:2].isdigit():
-                raise ValidationError({'gstin': 'First 2 characters must be state code (digits)'})
-
-    def save(self, *args, **kwargs):
-        self.full_clean()
-        super().save(*args, **kwargs)
 
 
 class Party(models.Model):
@@ -196,6 +57,13 @@ class Party(models.Model):
     - Filtering by party_type (Customer/Supplier/Both)
     - Used as dropdown in invoice/purchase forms
     """
+    organization = models.ForeignKey(
+        'account.Organization',
+        on_delete=models.CASCADE,
+        related_name='%(class)s_set',
+        null=True,
+        blank=True
+    )
     PARTY_TYPE_CHOICES = [
         ('Customer', 'Customer'),
         ('Supplier', 'Supplier'),
@@ -214,7 +82,7 @@ class Party(models.Model):
         help_text="GSTIN for B2B transactions (15 characters)"
     )
     state = models.ForeignKey(
-        State,
+        'configuration.State',
         on_delete=models.PROTECT,
         null=True,
         blank=True,
@@ -366,7 +234,7 @@ class Order(models.Model):
         related_name='orders'
     )
     business_location = models.ForeignKey(
-        BusinessLocation,
+        'configuration.Warehouse',
         on_delete=models.PROTECT,
         related_name='orders'
     )
@@ -671,13 +539,13 @@ class Invoice(models.Model):
         blank=True
     )
     billing_state = models.ForeignKey(
-        State,
+        'configuration.State',
         on_delete=models.PROTECT,
         related_name='invoices_billed',
         help_text="Place of supply (customer state)"
     )
     business_location = models.ForeignKey(
-        BusinessLocation,
+        'configuration.Warehouse',
         on_delete=models.PROTECT,
         related_name='invoices'
     )
@@ -1239,7 +1107,7 @@ class Receipt(models.Model):
         related_name='receipts'
     )
     business_location = models.ForeignKey(
-        BusinessLocation,
+        'configuration.Warehouse',
         on_delete=models.PROTECT,
         related_name='receipts'
     )
@@ -1338,7 +1206,7 @@ class PurchaseOrder(models.Model):
         related_name='purchase_orders'
     )
     business_location = models.ForeignKey(
-        BusinessLocation,
+        'configuration.Warehouse',
         on_delete=models.PROTECT,
         related_name='purchase_orders'
     )
@@ -1479,7 +1347,7 @@ class GoodReceiptNote(models.Model):
         related_name='grns'
     )
     business_location = models.ForeignKey(
-        BusinessLocation,
+        'configuration.Warehouse',
         on_delete=models.PROTECT,
         related_name='grns'
     )
@@ -1634,7 +1502,7 @@ class PurchaseInvoice(models.Model):
         related_name='purchase_invoices'
     )
     business_location = models.ForeignKey(
-        BusinessLocation,
+        'configuration.Warehouse',
         on_delete=models.PROTECT,
         related_name='purchase_invoices'
     )
@@ -1933,7 +1801,7 @@ class PaymentOut(models.Model):
         related_name='payments_out'
     )
     business_location = models.ForeignKey(
-        BusinessLocation,
+        'configuration.Warehouse',
         on_delete=models.PROTECT,
         related_name='payments_out'
     )

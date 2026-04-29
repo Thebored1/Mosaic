@@ -1,21 +1,33 @@
 """
-Configuration App Models
-=======================
+Configuration domain models.
 
-This module provides configuration models for business setup:
-- Organization - Multi-tenant business entity
-- Warehouse - Physical locations with GSTIN
-- State - Indian states for GST
-- ApiConfiguration - Bearer token authentication
+This module defines the platform-level setup data and authentication token
+storage:
+
+1. State captures Indian GST state metadata.
+2. Warehouse captures registered business locations and numbering sequences.
+3. ApiToken stores organization/ecommerce user tokens in hashed form.
+4. SuperAdminToken stores cross-organization privileged tokens in hashed form.
+
+The models here are shared by stock, sale, pos, commerce, and account flows.
 """
+
+import hashlib
+import secrets
 
 from django.db import models
 from django.core.exceptions import ValidationError
 from django.utils import timezone
+from django.contrib.auth.models import User
 
 
 class OrganizationModel(models.Model):
-    """Abstract base model with organization FK for multi-tenancy."""
+    """
+    Abstract base model with organization FK for multi-tenancy.
+
+    Models that inherit from this base are expected to be tenant-scoped unless
+    they intentionally support global visibility.
+    """
     organization = models.ForeignKey(
         'account.Organization',
         on_delete=models.CASCADE,
@@ -29,7 +41,12 @@ class OrganizationModel(models.Model):
 
 
 class State(OrganizationModel):
-    """Indian State for GST Place of Supply."""
+    """
+    Indian state master for GST place-of-supply calculations.
+
+    States are used whenever the application needs to determine intra-state vs
+    inter-state tax behavior or populate address/location selections.
+    """
     name = models.CharField(max_length=100)
     state_code = models.CharField(max_length=2)
     is_active = models.BooleanField(default=True)
@@ -38,48 +55,30 @@ class State(OrganizationModel):
         ordering = ['name']
 
     def __str__(self):
+        """Return the state name and code."""
         return f"{self.name} ({self.state_code})"
 
 
 class Warehouse(OrganizationModel):
     """
-    Physical Warehouse/Business Location with GSTIN Support
-    ========================================================
-    
-    Purpose:
-    - Manages physical warehouse/location of the business
-    - Stores GSTIN for multi-state GST compliance
-    - Generates invoice series for each location
-    - Tracks inventory per warehouse
-    
-    Migration Note:
-    - This model replaces BusinessLocation from the sale app
-    - BusinessLocation data should be migrated to this model
-    
-    Interaction:
-    - FK in sale.Invoice (for invoice numbering per location)
-    - FK in sale.PurchaseInvoice (for multi-location purchase tracking)
-    - FK in sale.Order (to track which location created the order)
-    - FK in sale.Receipt / sale.PaymentOut (to track payments per location)
-    - FK in sale.Quotation (for quotation per location)
-    - FK in stock.Batch (for batch inventory per warehouse)
-    - FK in stock.StockMovement (for stock transactions per warehouse)
-    - FK in stock.OpeningStock (for initial stock per warehouse)
-    - FK in stock.SerialNumber (for serial tracking per warehouse)
-    - FK in pos.Shift (for shift management per warehouse)
-    
-    Invoice Numbering Logic:
-    - Format: {GSTIN}/{Financial Year}/{Sequential Number}
-    - Example: 27AAAAA0000A1Z5/2025-26/00001
-    - Each warehouse has its own sequence counter
-    - When creating invoice, the warehouse determines the prefix
-    
-    Endpoint Interaction:
-    - GET/POST /v1/configuration/warehouses/ - List/Create warehouses
-    - GET/PUT/DELETE /v1/configuration/warehouses/{id}/ - Warehouse detail
-    - PUT /v1/configuration/warehouses/{id}/set-default/ - Set as default
-    - On invoice creation, automatically uses warehouse's GSTIN for numbering
+    Physical warehouse or business location with GSTIN support.
+
+    Warehouses represent registered business locations. They supply the GSTIN
+    and financial-year invoice numbering used throughout the sale and purchase
+    workflows, and they also act as the physical anchor for inventory and POS
+    operations.
+
+    The model replaced the older sale-app `BusinessLocation` concept so the
+    tenancy and numbering logic can live in one shared location.
     """
+    state = models.ForeignKey(
+        'State',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='warehouses',
+        help_text='State of registration for GST purposes'
+    )
     gstin = models.CharField(
         max_length=15,
         unique=True,
@@ -135,18 +134,11 @@ class Warehouse(OrganizationModel):
 
     def get_next_invoice_number(self):
         """
-        Generate next invoice number for this warehouse.
-        
-        Format: {GSTIN}/{FY}/{NNNNN}
-        Example: 27AAAAA0000A1Z5/2025-26/00001
-        
-        Interaction:
-        - Increments invoice_sequence by 1
-        - Uses current financial year
-        - Called by sale.Invoice.save() during finalization
-        
-        Returns:
-            str: Formatted invoice number
+        Generate the next invoice number for this warehouse.
+
+        The numbering pattern is GSTIN plus financial year plus sequence. The
+        method increments the warehouse's sequence counter and returns the
+        formatted value used by invoice creation.
         """
         self.invoice_sequence += 1
         self.save(update_fields=['invoice_sequence'])
@@ -156,13 +148,10 @@ class Warehouse(OrganizationModel):
 
     def get_next_purchase_invoice_number(self):
         """
-        Generate next purchase invoice number for this warehouse.
-        
-        Format: {GSTIN}/PO/{FY}/{NNNNN}
-        Example: 27AAAAA0000A1Z5/PO/2025-26/00001
-        
-        Returns:
-            str: Formatted purchase invoice number
+        Generate the next purchase invoice number for this warehouse.
+
+        Purchase invoice numbering uses the same warehouse sequence pattern as
+        sales invoices, but with a purchase-specific marker.
         """
         self.purchase_invoice_sequence += 1
         self.save(update_fields=['purchase_invoice_sequence'])
@@ -172,18 +161,11 @@ class Warehouse(OrganizationModel):
 
     def get_current_financial_year(self):
         """
-        Get current financial year based on date.
-        
-        Logic:
-        - April to December: FY is current_year - next_year
-        - January to March: FY is previous_year - current_year
-        
-        Example:
-        - April 2025 to March 2026 = 2025-26
-        - January 2025 = 2024-25
-        
-        Returns:
-            str: Financial year in format YYYY-YY
+        Return the current Indian financial year.
+
+        The financial year rolls over on April 1. This format is used by invoice
+        numbering, purchase invoice numbering, and any fiscal reporting that
+        needs a compact year label.
         """
         today = timezone.now().date()
         if today.month >= 4:
@@ -193,11 +175,9 @@ class Warehouse(OrganizationModel):
     def clean(self):
         """
         Validate warehouse data.
-        
-        Validation:
-        - GSTIN must be exactly 15 characters
-        - First 2 characters of GSTIN must be digits (state code)
-        - If is_default=True, unset other default warehouses
+
+        Validation checks the GSTIN format and keeps only one default warehouse
+        active at a time across the tenant.
         """
         super().clean()
         if self.gstin:
@@ -211,39 +191,156 @@ class Warehouse(OrganizationModel):
             Warehouse.objects.filter(is_default=True).exclude(pk=self.pk).update(is_default=False)
 
     def save(self, *args, **kwargs):
+        """Run validation before saving the warehouse."""
         self.full_clean()
         super().save(*args, **kwargs)
 
 
-class ApiConfiguration(models.Model):
-    """API Bearer Token per Organization."""
-    organization = models.OneToOneField(
-        'account.Organization',
+class ApiToken(models.Model):
+    """
+    Hashed API token linked to a UserAccount.
+
+    Tokens are stored as hashes rather than plaintext so the database does not
+    contain reusable bearer secrets. The raw token is only returned once at
+    issuance time or rotation time.
+    """
+    user_account = models.OneToOneField(
+        'account.UserAccount',
         on_delete=models.CASCADE,
-        related_name='api_configuration',
-        null=True,
-        blank=True
+        related_name='api_token'
     )
-    api_bearer_token = models.CharField(max_length=64)
+    token = models.CharField(max_length=128, blank=True, default='', editable=False)
+    token_hash = models.CharField(max_length=64, unique=True)
+    token_prefix = models.CharField(max_length=12, blank=True, default='')
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        verbose_name = 'API Configuration'
-        verbose_name_plural = 'API Configuration'
+        verbose_name = 'API Token'
+        verbose_name_plural = 'API Tokens'
+
+    @staticmethod
+    def hash_token(raw_token):
+        """Return a SHA-256 hash for a raw token value."""
+        return hashlib.sha256(raw_token.encode('utf-8')).hexdigest()
+
+    @classmethod
+    def generate_raw_token(cls):
+        """Generate an unpredictable raw bearer token."""
+        return secrets.token_urlsafe(32)
+
+    @classmethod
+    def issue_token(cls, user_account):
+        """Create and persist a new token for the supplied user account."""
+        raw_token = cls.generate_raw_token()
+        token = cls(user_account=user_account)
+        token.set_raw_token(raw_token)
+        token.save()
+        return token, raw_token
+
+    def set_raw_token(self, raw_token):
+        """Store the hashed representation of a raw token."""
+        self.token_hash = self.hash_token(raw_token)
+        self.token_prefix = raw_token[:8]
+        self.token = ''
+
+    def rotate_token(self):
+        """Generate a new raw token and replace the stored hash."""
+        raw_token = self.generate_raw_token()
+        self.set_raw_token(raw_token)
+        self.is_active = True
+        self.save(update_fields=['token_hash', 'token_prefix', 'token', 'is_active', 'updated_at'])
+        return raw_token
+
+    def revoke_token(self):
+        """Mark the token as inactive without deleting the record."""
+        self.is_active = False
+        self.save(update_fields=['is_active', 'updated_at'])
+        return None
 
     def __str__(self):
-        return f"API - {self.organization.name}"
+        """Return a human-readable token label."""
+        return f"Token - {self.user_account.user.username} ({self.user_account.organization.name})"
 
-    def delete(self, *args, **kwargs):
-        """
-        Prevent deletion of singleton.
-        
-        Raises:
-            ValidationError: Cannot delete the only API configuration
-        """
-        raise ValidationError("Cannot delete the API configuration. Edit it instead.")
+
+class SuperAdminToken(models.Model):
+    """
+    Hashed super admin token for cross-organization access.
+
+    Super admin tokens are intentionally separate from organization/user tokens
+    because they bypass tenant scoping and are only meant for platform-wide
+    support, reporting, or administrative operations.
+    """
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name='super_admin_token',
+        help_text="User must be a superuser"
+    )
+    token = models.CharField(max_length=128, blank=True, default='', editable=False)
+    token_hash = models.CharField(max_length=64, unique=True)
+    token_prefix = models.CharField(max_length=12, blank=True, default='')
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Super Admin Token'
+        verbose_name_plural = 'Super Admin Tokens'
+
+    @staticmethod
+    def hash_token(raw_token):
+        """Return a SHA-256 hash for a raw super admin token."""
+        return hashlib.sha256(raw_token.encode('utf-8')).hexdigest()
+
+    @classmethod
+    def generate_raw_token(cls):
+        """Generate an unpredictable raw token for a super admin principal."""
+        return secrets.token_urlsafe(32)
+
+    @classmethod
+    def issue_token(cls, user):
+        """Create and persist a super admin token for the supplied user."""
+        token = cls(user=user)
+        raw_token = cls.generate_raw_token()
+        token.set_raw_token(raw_token)
+        token.save()
+        return token, raw_token
+
+    def set_raw_token(self, raw_token):
+        """Store the hashed representation of a raw super admin token."""
+        self.token_hash = self.hash_token(raw_token)
+        self.token_prefix = raw_token[:8]
+        self.token = ''
+
+    def rotate_token(self):
+        """Generate a new raw token and replace the stored super admin hash."""
+        raw_token = self.generate_raw_token()
+        self.set_raw_token(raw_token)
+        self.is_active = True
+        self.save(update_fields=['token_hash', 'token_prefix', 'token', 'is_active', 'updated_at'])
+        return raw_token
+
+    def revoke_token(self):
+        """Mark the super admin token as inactive without deleting it."""
+        self.is_active = False
+        self.save(update_fields=['is_active', 'updated_at'])
+        return None
+
+    def clean(self):
+        """Ensure the token is tied to a real Django superuser account."""
+        super().clean()
+        if not self.user:
+            raise ValidationError({'user': 'Super Admin Token must be linked to a superuser'})
+        if not self.user.is_superuser:
+            raise ValidationError({'user': 'Only superusers can be linked to a Super Admin Token'})
+
+    def save(self, *args, **kwargs):
+        """Validate the super admin token before persisting it."""
+        self.full_clean()
+        super().save(*args, **kwargs)
 
     def __str__(self):
-        return 'API Configuration'
+        """Return a human-readable super admin token label."""
+        return f"SuperAdmin - {self.user.username}"

@@ -1,13 +1,13 @@
 """
-POS App Models
-==============
+POS domain models.
 
-This module provides POS-specific models for shift and cash management.
+This module holds the operational shift ledger for the point-of-sale surface:
 
-Models:
--------
-Shift - Cashier shift management
-CashTransaction - Cash in/out during shift
+1. Shift tracks a cashier session from opening cash to closing variance.
+2. CashTransaction records cash in/out movements during the shift.
+
+POS is deliberately separate from storefront commerce because it reflects the
+in-person billing and cash reconciliation workflow of a physical counter.
 """
 
 from decimal import Decimal
@@ -20,49 +20,11 @@ from configuration.models import Warehouse
 
 class Shift(models.Model):
     """
-    Cashier/Counter Shift Management
-    =================================
-    
-    Purpose:
-    - Track individual cashier shifts
-    - Record opening/closing cash counts
-    - Calculate variance for accountability
-    - Enable shift-wise sales reporting
-    
-    Workflow:
-    1. Cashier opens shift (sets opening_cash)
-    2. During shift: record cash in/out transactions
-    3. End of day: cashier closes shift (sets closing_cash)
-    4. System calculates variance
-    
-    Status Flow:
-    Open -> Closed
-    
-    Interaction:
-    - FK to User (cashier)
-    - FK to Warehouse (location)
-    - FK to CashTransaction (transactions during shift)
-    - FK to sale.Order (orders in this shift)
-    - FK to sale.Invoice (invoices in this shift)
-    
-    Reporting:
-    - Shift sales total
-    - Cash collected
-    - Variance (closing - expected)
-    
-    Endpoint Interaction:
-    - GET /shifts/ - List all shifts
-    - POST /shifts/ - Create new shift (open shift)
-    - GET /shifts/{id}/ - Get shift details
-    - POST /shifts/{id}/close/ - Close shift
-    - GET /shifts/{id}/transactions/ - List cash transactions
-    - POST /shifts/{id}/transactions/ - Add cash transaction
-    
-    Query Parameters:
-        ?status=Open - Filter by status
-        ?warehouse=1 - Filter by warehouse
-        ?cashier=1 - Filter by cashier
-        ?date=2025-04-28 - Filter by date
+    Cashier or counter shift session.
+
+    A shift represents the lifecycle of a single cashier session. It captures
+    opening and closing cash, computes variance, and anchors all in-shift cash
+    transactions and sales reporting.
     """
     STATUS_CHOICES = [
         ('Open', 'Open'),
@@ -139,6 +101,7 @@ class Shift(models.Model):
         ordering = ['-opening_time']
 
     def __str__(self):
+        """Return the shift number, cashier, and status."""
         return f"{self.shift_number} - {self.user.username} - {self.status}"
 
     def save(self, *args, **kwargs):
@@ -147,15 +110,7 @@ class Shift(models.Model):
         super().save(*args, **kwargs)
 
     def generate_shift_number(self):
-        """
-        Generate unique shift number.
-        
-        Format: SH{YYYYMMDD}{NNNN}
-        Example: SH202504280001
-        
-        Returns:
-            str: Unique shift number
-        """
+        """Generate a unique shift number for the current date."""
         today = timezone.now().date()
         prefix = f"SH{today.strftime('%Y%m%d')}"
         last_shift = Shift.objects.filter(
@@ -173,22 +128,9 @@ class Shift(models.Model):
     def close(self, closing_cash_amount):
         """
         Close the shift and calculate variance.
-        
-        Args:
-            closing_cash_amount (Decimal): Actual cash in drawer
-            
-        Workflow:
-        1. Set closing_cash
-        2. Calculate expected cash from all transactions
-        3. Calculate variance (closing - expected)
-        4. Set status to Closed
-        5. Set closing_time
-        
-        Expected Cash Calculation:
-        = opening_cash + cash.in.sum() - cash.out.sum()
-        
-        Returns:
-            dict: Shift with variance calculation
+
+        Closing a shift freezes the session, computes expected cash from cash
+        transactions, and stores the variance for reconciliation.
         """
         from django.db.models import Sum
         
@@ -226,12 +168,7 @@ class Shift(models.Model):
 
     @property
     def sales_total(self):
-        """
-        Calculate total sales during this shift.
-        
-        Returns:
-            Decimal: Sum of all invoices in this shift
-        """
+        """Calculate total sales during this shift."""
         from django.db.models import Sum
         from sale.models import Invoice
         
@@ -246,12 +183,7 @@ class Shift(models.Model):
 
     @property
     def transaction_summary(self):
-        """
-        Get cash transaction summary for this shift.
-        
-        Returns:
-            dict: cash_in, cash_out, net difference
-        """
+        """Return a cash-in / cash-out summary for the shift."""
         from django.db.models import Sum
         
         cash_in = self.transactions.filter(
@@ -271,32 +203,10 @@ class Shift(models.Model):
 
 class CashTransaction(models.Model):
     """
-    Cash In/Out Transactions During Shift
-    ==================================
-    
-    Purpose:
-    - Record cash movements during a shift
-    - Track cash deposits, withdrawals, expenses
-    - Enable cash reconciliation
-    
-    Transaction Types:
-    - CashIn: Cash deposits (bank deposit, collections)
-    - CashOut: Withdrawals (expenses, petty cash, bank deposit)
-    
-    Interaction:
-    - FK to Shift (parent shift)
-    - FK to User (recorded by)
-    
-    Common Use Cases:
-    - Bank deposit (CashIn, reference=bank receipt)
-    - Expense payout (CashOut, reason=lunch, expense)
-    - Cash withdrawal (CashOut, reason=personal)
-    - Change fund (CashIn, reason=change)
-    
-    Endpoint Interaction:
-    - GET /shifts/{shift_id}/transactions/ - List transactions
-    - POST /shifts/{shift_id}/transactions/ - Add transaction
-    - DELETE /transactions/{id}/ - Delete transaction
+    Cash in/out transaction recorded during a shift.
+
+    Transactions capture the movement of physical cash while a shift is open
+    so reconciliation can explain why closing cash differs from opening cash.
     """
     TRANSACTION_TYPE_CHOICES = [
         ('CashIn', 'Cash In'),
@@ -342,16 +252,11 @@ class CashTransaction(models.Model):
         ordering = ['-created_at']
 
     def __str__(self):
+        """Return the shift number, transaction type, and amount."""
         return f"{self.shift.shift_number} - {self.transaction_type} - ₹{self.amount}"
 
     def clean(self):
-        """
-        Validate transaction.
-        
-        Rules:
-        - Amount must be positive
-        - Cannot modify closed shift transactions
-        """
+        """Validate the cash transaction before saving."""
         super().clean()
         if self.amount and self.amount <= 0:
             raise ValidationError({'amount': 'Amount must be positive'})

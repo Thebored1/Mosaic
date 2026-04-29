@@ -1,12 +1,12 @@
 """
 Configuration App Admin
-====================
+======================
 
 This module provides admin configuration for configuration models.
 """
 
-from django.contrib import admin
-from .models import Warehouse, ApiConfiguration
+from django.contrib import admin, messages
+from .models import Warehouse, ApiToken, SuperAdminToken
 
 
 @admin.register(Warehouse)
@@ -54,36 +54,28 @@ class WarehouseAdmin(admin.ModelAdmin):
     )
 
 
-@admin.register(ApiConfiguration)
-class ApiConfigurationAdmin(admin.ModelAdmin):
-    """
-    Admin configuration for ApiConfiguration model.
-    
-    Due to singleton pattern, only edit form is shown.
-    No list view - just single edit form.
-    
-    Fields:
-        - api_bearer_token
-        - is_active
-    
-    Read-only:
-        - created_at, updated_at
-    
-    Note:
-        Token is displayed as masked in admin for security.
-    """
-    list_display = ['is_active', 'created_at', 'updated_at']
-    fields = ['api_bearer_token', 'is_active']
+@admin.register(ApiToken)
+class ApiTokenAdmin(admin.ModelAdmin):
+    """Admin configuration for ApiToken model."""
+    list_display = ['user_account', 'token_prefix', 'is_active', 'created_at', 'updated_at']
+    list_filter = ['is_active']
+    search_fields = ['user_account__user__username', 'user_account__organization__name']
     readonly_fields = ['created_at', 'updated_at']
-    
-    def has_add_permission(self, request):
-        """Prevent adding new configuration."""
-        return False
-    
-    def has_delete_permission(self, request):
-        """Prevent deleting configuration."""
-        return False
-    
-    def get_queryset(self, request):
-        """Return singleton instance."""
-        return self.model.objects.filter(pk=1)
+    raw_id_fields = ['user_account']
+
+
+@admin.register(SuperAdminToken)
+class SuperAdminTokenAdmin(admin.ModelAdmin):
+    """Admin configuration for SuperAdminToken model."""
+    list_display = ['user', 'token_prefix', 'is_active', 'created_at', 'updated_at']
+    list_filter = ['is_active']
+    search_fields = ['user__username', 'user__email']
+    readonly_fields = ['created_at', 'updated_at']
+    raw_id_fields = ['user']
+    actions = ['regenerate_token']
+
+    @admin.action(description='Regenerate selected tokens')
+    def regenerate_token(self, request, queryset):
+        for obj in queryset:
+            new_token = obj.rotate_token()
+            self.message_user(request, f"Regenerated token for {obj.user.username}: {new_token}", messages.SUCCESS)

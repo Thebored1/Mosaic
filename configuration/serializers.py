@@ -1,17 +1,18 @@
 """
 Configuration App Serializers
-=============================
+==============================
 
 This module provides serializers for configuration models.
 
 Serializers:
 ----------
 WarehouseSerializer - Serializer for Warehouse model
-ApiConfigurationSerializer - Serializer for ApiConfiguration model
+ApiTokenSerializer - Serializer for API tokens (linked to users)
+SuperAdminTokenSerializer - Serializer for super admin tokens
 """
 
 from rest_framework import serializers
-from .models import State, Warehouse, ApiConfiguration
+from .models import State, Warehouse, ApiToken, SuperAdminToken
 
 
 class StateSerializer(serializers.ModelSerializer):
@@ -70,8 +71,22 @@ class WarehouseSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class ApiConfigurationSerializer(serializers.ModelSerializer):
+class ApiTokenSerializer(serializers.ModelSerializer):
+    """Serializer for ApiToken model."""
+    username = serializers.CharField(source='user_account.user.username', read_only=True)
+    organization_name = serializers.CharField(source='user_account.organization.name', read_only=True)
+
     class Meta:
-        model = ApiConfiguration
-        fields = ['id', 'api_bearer_token', 'is_active', 'created_at', 'updated_at']
+        model = ApiToken
+        fields = ['id', 'username', 'organization_name', 'is_active', 'created_at', 'updated_at']
+        read_only_fields = ['created_at', 'updated_at']
+
+
+class SuperAdminTokenSerializer(serializers.ModelSerializer):
+    """Serializer for SuperAdminToken model."""
+    username = serializers.CharField(source='user.username', read_only=True)
+
+    class Meta:
+        model = SuperAdminToken
+        fields = ['id', 'username', 'token_prefix', 'is_active', 'created_at', 'updated_at']
         read_only_fields = ['created_at', 'updated_at']
