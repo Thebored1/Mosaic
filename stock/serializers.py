@@ -151,7 +151,8 @@ class ItemListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'sku', 'description', 'category', 'unit',
             'tax_code', 'cgst_rate', 'sgst_rate', 'igst_rate',
-            'has_variants', 'current_stock', 'min_stock_level',
+            'has_variants', 'valuation_method', 'requires_serial_tracking',
+            'current_stock', 'min_stock_level',
             'max_stock_level', 'unit_price', 'cost_price', 'is_active',
             'created_at', 'updated_at'
         ]

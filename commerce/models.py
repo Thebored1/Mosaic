@@ -49,6 +49,53 @@ def quantize_money(value):
     return Decimal(value).quantize(Decimal('0.01'))
 
 
+def _stock_event_for_listing(
+    listing,
+    movement_type,
+    quantity,
+    *,
+    rate=None,
+    reference_number='',
+    notes='',
+    apply_posting=True,
+    source_document_type='',
+    source_document_id='',
+    source_line_reference='',
+):
+    """
+    Create a stock ledger entry for a commerce listing.
+
+    The commerce app never mutates `current_stock` directly anymore. It either
+    records an audit-only reserve/release event or posts an actual stock
+    movement through the shared stock service.
+    """
+    from stock.services import post_stock_movement, record_stock_movement
+
+    item = listing.item
+    item_variant = listing.item_variant
+    effective_rate = rate if rate is not None else listing.price
+    payload = {
+        'organization': listing.organization,
+        'movement_type': movement_type,
+        'item': item,
+        'item_variant': item_variant,
+        'quantity': quantity,
+        'rate': effective_rate,
+        'cgst_rate': item.cgst_rate if item else Decimal('0'),
+        'sgst_rate': item.sgst_rate if item else Decimal('0'),
+        'igst_rate': item.igst_rate if item else Decimal('0'),
+        'total_amount': quantize_money(Decimal(quantity) * effective_rate),
+        'reference_number': reference_number,
+        'notes': notes,
+        'source_document_type': source_document_type,
+        'source_document_id': source_document_id,
+        'source_line_reference': source_line_reference,
+    }
+    if apply_posting:
+        return post_stock_movement(**payload)
+    return record_stock_movement(**payload)
+
+
 def get_active_commerce_settings(organization):
     """
     Return the commerce settings row for an organization, creating it if needed.
@@ -81,6 +128,38 @@ def get_listing_reservation_quantity(listing):
     return aggregate['total'] or Decimal('0')
 
 
+def get_locked_listing_available_quantity(listing):
+    """
+    Compute available stock for a listing under database row locks.
+
+    Checkout needs a single consistent stock snapshot so two concurrent orders
+    cannot both pass the availability check before one of them writes the new
+    reservation. This helper locks the source inventory row and the active
+    reservation rows that belong to the same source before calculating the
+    remaining quantity.
+    """
+    source = listing.item_variant if listing.item_variant_id else listing.item
+    if source is None:
+        return None
+
+    locked_source = source.__class__.objects.select_for_update().get(pk=source.pk)
+    reservation_queryset = InventoryReservation.objects.select_for_update().filter(
+        status='reserved',
+        organization_id=listing.organization_id,
+    )
+    if listing.item_variant_id:
+        reservation_queryset = reservation_queryset.filter(item_variant_id=listing.item_variant_id)
+    else:
+        reservation_queryset = reservation_queryset.filter(item_id=listing.item_id, item_variant__isnull=True)
+
+    reserved_quantity = sum(
+        (quantity or Decimal('0') for quantity in reservation_queryset.values_list('quantity', flat=True)),
+        Decimal('0'),
+    )
+    current_stock = locked_source.current_stock or Decimal('0')
+    return quantize_money(current_stock - reserved_quantity)
+
+
 def get_listing_effective_price(listing, account):
     """
     Resolve the price a buyer should see for a listing.
@@ -111,17 +190,15 @@ def adjust_inventory(listing, quantity_delta):
     available stock. The helper keeps inventory updates in one place so checkout
     shipping and manual returns can both reuse the same consistency rules.
     """
-    source = listing.item_variant if listing.item_variant_id else listing.item
-    if source is None:
-        return
-
-    current_stock = source.current_stock or Decimal('0')
-    new_stock = quantize_money(current_stock + Decimal(quantity_delta))
-    if new_stock < 0:
-        raise ValidationError('Inventory cannot go below zero.')
-
-    source.current_stock = new_stock
-    source.save(update_fields=['current_stock', 'updated_at'] if hasattr(source, 'updated_at') else ['current_stock'])
+    _stock_event_for_listing(
+        listing,
+        'Adjustment',
+        quantity_delta,
+        apply_posting=True,
+        source_document_type='commerce.adjust_inventory',
+        source_document_id='',
+        source_line_reference='',
+    )
 
 
 class CommerceListing(models.Model):
@@ -678,19 +755,15 @@ class CommerceOrder(models.Model):
         for cart_item in cart.items.select_related('listing', 'listing__item', 'listing__item_variant', 'listing__organization'):
             listing = cart_item.listing
             price = quantize_money(get_listing_effective_price(listing, cart.user_account))
-            source = listing.item_variant if listing.item_variant_id else listing.item
             seller_settings = get_active_commerce_settings(listing.organization)
             should_reserve_stock = True if seller_settings is None else seller_settings.reserve_stock_on_checkout
             prevent_oversell = True if seller_settings is None else seller_settings.prevent_oversell
             if should_reserve_stock:
-                if source is not None and prevent_oversell:
-                    source.__class__.objects.select_for_update().get(pk=source.pk)
-                    InventoryReservation.objects.select_for_update().filter(
-                        listing=listing,
-                        status='reserved',
-                    ).exists()
-
-                available_quantity = listing.available_quantity
+                available_quantity = (
+                    get_locked_listing_available_quantity(listing)
+                    if prevent_oversell
+                    else listing.available_quantity
+                )
                 if available_quantity is not None and cart_item.quantity > available_quantity:
                     raise ValidationError({
                         'quantity': f'Requested quantity exceeds available stock for {listing.title}.'
@@ -720,6 +793,19 @@ class CommerceOrder(models.Model):
                     quantity=cart_item.quantity,
                     status='reserved',
                 )
+
+            _stock_event_for_listing(
+                listing,
+                'Reserve',
+                cart_item.quantity,
+                rate=price,
+                reference_number=order.order_number,
+                notes='Reserved during checkout',
+                apply_posting=False,
+                source_document_type='commerce.CommerceOrderLine',
+                source_document_id=order_line.pk,
+                source_line_reference=order_line.pk,
+            )
 
         order.recalculate_totals()
         if cart.channel == 'marketplace':
@@ -1155,11 +1241,24 @@ class InventoryReservation(models.Model):
         Release is used when a shopper cancels before shipment or when an order
         expires without being fulfilled.
         """
-        self.status = 'released'
-        self.released_at = timezone.now()
-        if notes:
-            self.notes = notes
-        self.save(update_fields=['status', 'released_at', 'notes'])
+        with transaction.atomic():
+            self.status = 'released'
+            self.released_at = timezone.now()
+            if notes:
+                self.notes = notes
+            _stock_event_for_listing(
+                self.listing,
+                'Release',
+                self.quantity,
+                rate=self.order_line.unit_price,
+                reference_number=self.order.order_number,
+                notes=notes,
+                apply_posting=False,
+                source_document_type='commerce.InventoryReservation',
+                source_document_id=self.pk,
+                source_line_reference=self.order_line_id,
+            )
+            self.save(update_fields=['status', 'released_at', 'notes'])
 
     def consume(self, notes=''):
         """
@@ -1171,13 +1270,24 @@ class InventoryReservation(models.Model):
         """
         if self.status != 'reserved':
             raise ValidationError('Only reserved stock can be consumed.')
-
-        adjust_inventory(self.listing, Decimal('-1') * self.quantity)
-        self.status = 'consumed'
-        self.consumed_at = timezone.now()
-        if notes:
-            self.notes = notes
-        self.save(update_fields=['status', 'consumed_at', 'notes'])
+        with transaction.atomic():
+            _stock_event_for_listing(
+                self.listing,
+                'Sale',
+                self.quantity,
+                rate=self.order_line.unit_price,
+                reference_number=self.order.order_number,
+                notes=notes,
+                apply_posting=True,
+                source_document_type='commerce.InventoryReservation',
+                source_document_id=self.pk,
+                source_line_reference=self.order_line_id,
+            )
+            self.status = 'consumed'
+            self.consumed_at = timezone.now()
+            if notes:
+                self.notes = notes
+            self.save(update_fields=['status', 'consumed_at', 'notes'])
 
 
 class CommerceShipment(models.Model):
@@ -1268,24 +1378,36 @@ class CommerceShipment(models.Model):
         actual item or variant stock is reduced only when the package leaves
         the seller's control.
         """
-        if self.order.status == 'cancelled':
-            raise ValidationError('Cancelled orders cannot be shipped.')
+        with transaction.atomic():
+            if self.order.status == 'cancelled':
+                raise ValidationError('Cancelled orders cannot be shipped.')
 
-        reservations_by_line = {
-            reservation.order_line_id: reservation
-            for reservation in self.order.reservations.select_related('listing').all()
-        }
-        for order_line in self.order.lines.select_related('listing').all():
-            reservation = reservations_by_line.get(order_line.id)
-            if reservation is not None and reservation.status == 'reserved':
-                reservation.consume(notes=notes)
-            elif reservation is None:
-                adjust_inventory(order_line.listing, Decimal('-1') * order_line.quantity)
-        self.status = 'shipped'
-        if notes:
-            self.notes = notes
-        self.shipped_at = timezone.now()
-        self.save(update_fields=['status', 'notes', 'shipped_at', 'updated_at'])
+            reservations_by_line = {
+                reservation.order_line_id: reservation
+                for reservation in self.order.reservations.select_related('listing').all()
+            }
+            for order_line in self.order.lines.select_related('listing').all():
+                reservation = reservations_by_line.get(order_line.id)
+                if reservation is not None and reservation.status == 'reserved':
+                    reservation.consume(notes=notes)
+                elif reservation is None:
+                    _stock_event_for_listing(
+                    order_line.listing,
+                    'Sale',
+                    order_line.quantity,
+                    rate=order_line.unit_price,
+                    reference_number=self.order.order_number,
+                    notes=notes,
+                    apply_posting=True,
+                    source_document_type='commerce.CommerceOrderLine',
+                        source_document_id=order_line.pk,
+                        source_line_reference=order_line.pk,
+                    )
+            self.status = 'shipped'
+            if notes:
+                self.notes = notes
+            self.shipped_at = timezone.now()
+            self.save(update_fields=['status', 'notes', 'shipped_at', 'updated_at'])
 
     def mark_delivered(self, notes=''):
         """Mark the order as delivered after seller confirmation."""
@@ -1401,13 +1523,24 @@ class CommerceReturnRequest(models.Model):
         """
         if self.status != 'received':
             raise ValidationError('Returns can only be processed after the items are received.')
-
-        adjust_inventory(self.order_line.listing, self.quantity)
-        self.status = 'processed'
-        self.processed_at = timezone.now()
-        if notes:
-            self.notes = notes
-        self.save(update_fields=['status', 'processed_at', 'notes'])
+        with transaction.atomic():
+            _stock_event_for_listing(
+            self.order_line.listing,
+            'Return',
+            self.quantity,
+            rate=self.order_line.unit_price,
+            reference_number=self.order.order_number,
+            notes=notes,
+            apply_posting=True,
+            source_document_type='commerce.CommerceReturnRequest',
+                source_document_id=self.pk,
+                source_line_reference=self.order_line_id,
+            )
+            self.status = 'processed'
+            self.processed_at = timezone.now()
+            if notes:
+                self.notes = notes
+            self.save(update_fields=['status', 'processed_at', 'notes'])
 
 
 class CommerceRefund(models.Model):

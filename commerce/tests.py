@@ -8,7 +8,7 @@ from rest_framework.test import APITestCase
 
 from account.models import Organization, UserAccount
 from configuration.models import ApiToken
-from stock.models import Item
+from stock.models import Item, StockMovement
 
 from .models import (
     Cart,
@@ -163,6 +163,7 @@ class CommerceFlowTests(APITestCase):
         self.assertEqual(order.lines.get().organization_id, self.seller_org.id)
         self.assertEqual(InventoryReservation.objects.count(), 1)
         self.assertEqual(InventoryReservation.objects.get().status, 'reserved')
+        self.assertEqual(StockMovement.objects.filter(movement_type='Reserve').count(), 1)
 
     def test_checkout_reservation_can_be_released_before_shipment(self):
         """Checkout should reserve stock and cancellation before shipment should release it."""
@@ -200,6 +201,7 @@ class CommerceFlowTests(APITestCase):
         order.refresh_from_db()
         self.assertEqual(order.status, 'cancelled')
         self.assertEqual(InventoryReservation.objects.filter(order=order, status='released').count(), 1)
+        self.assertEqual(StockMovement.objects.filter(movement_type='Release').count(), 1)
         self.seller_item.refresh_from_db()
         self.assertEqual(self.seller_item.current_stock, Decimal('25'))
 
@@ -247,6 +249,7 @@ class CommerceFlowTests(APITestCase):
         self.seller_item.refresh_from_db()
         self.assertEqual(self.seller_item.current_stock, Decimal('23'))
         self.assertEqual(InventoryReservation.objects.filter(order=order, status='consumed').count(), 1)
+        self.assertEqual(StockMovement.objects.filter(movement_type='Sale', posting_state='Posted').count(), 1)
 
         self.auth(self.buyer_token)
         cancel_response = self.client.post(f'/v1/commerce/orders/{order.id}/cancel/', {}, format='json')
@@ -328,6 +331,7 @@ class CommerceFlowTests(APITestCase):
         self.assertEqual(process_response.status_code, status.HTTP_200_OK)
         self.seller_item.refresh_from_db()
         self.assertEqual(self.seller_item.current_stock, Decimal('25'))
+        self.assertEqual(StockMovement.objects.filter(movement_type='Return', posting_state='Posted').count(), 1)
 
     def test_marketplace_checkout_splits_settlements_by_seller(self):
         """Marketplace checkout should create one settlement per seller organization."""

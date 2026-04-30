@@ -6,8 +6,8 @@ from rest_framework.test import APITestCase
 
 from account.models import Organization, UserAccount
 from configuration.models import ApiToken, State, SuperAdminToken, Warehouse
-from sale.models import Party
-from stock.models import Category, Item
+from sale.models import Party, Order, OrderItem, Invoice, PriceList, PriceListItem, Quotation
+from stock.models import Category, Item, StockMovement
 
 
 class SaleAuthTests(APITestCase):
@@ -69,7 +69,18 @@ class SaleAuthTests(APITestCase):
             name='Item One',
             sku='ITEM-001',
             category=category,
+            current_stock=Decimal('20'),
             unit_price=Decimal('100.00'),
+        )
+        self.price_list = PriceList.objects.create(
+            organization=self.organization,
+            name='Default Price List',
+            effective_from='2026-04-01',
+        )
+        PriceListItem.objects.create(
+            price_list=self.price_list,
+            item=self.item,
+            rate=Decimal('80.00'),
         )
 
     def test_party_list_is_scoped_to_authenticated_organization(self):
@@ -125,3 +136,139 @@ class SaleAuthTests(APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_walk_in_order_conversion_uses_business_location_state(self):
+        order = Order.objects.create(
+            business_location=self.warehouse,
+            party=None,
+            discount_amount=Decimal('0.00'),
+            discount_type='Fixed',
+        )
+        OrderItem.objects.create(
+            order=order,
+            item=self.item,
+            quantity=Decimal('1.0000'),
+            unit=None,
+            rate=Decimal('100.00'),
+            discount=Decimal('0.00'),
+        )
+
+        response = self.client.post(
+            f'/v1/sale/orders/{order.id}/convert/',
+            {
+                'invoice_type': 'Tax Invoice',
+                'due_date': '2026-05-30',
+                'notes': 'Walk-in sale',
+            },
+            format='json',
+            HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        invoice = Invoice.objects.get(id=response.data['invoice_id'])
+        self.assertEqual(invoice.status, 'Draft')
+        self.assertEqual(invoice.billing_state_id, self.state.id)
+
+    def test_daily_sales_reports_only_finalized_invoices(self):
+        Invoice.objects.create(
+            invoice_number='INV-0001',
+            invoice_type='Tax Invoice',
+            billing_state=self.state,
+            business_location=self.warehouse,
+            grand_total=Decimal('100.00'),
+            cgst_amount=Decimal('9.00'),
+            sgst_amount=Decimal('9.00'),
+            igst_amount=Decimal('0.00'),
+            taxable_amount=Decimal('82.00'),
+            status='Finalized',
+        )
+        Invoice.objects.create(
+            invoice_number='INV-0002',
+            invoice_type='Tax Invoice',
+            billing_state=self.state,
+            business_location=self.warehouse,
+            grand_total=Decimal('200.00'),
+            cgst_amount=Decimal('18.00'),
+            sgst_amount=Decimal('18.00'),
+            igst_amount=Decimal('0.00'),
+            taxable_amount=Decimal('164.00'),
+            status='Cancelled',
+        )
+
+        response = self.client.get(
+            '/v1/sale/reports/daily_sales/',
+            HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['invoice_count'], 1)
+        self.assertEqual(response.data['total_sales'], '100')
+
+    def test_price_list_update_and_quotation_conversion_uses_snapshot_price(self):
+        price_list_response = self.client.patch(
+            f'/v1/sale/price-lists/{self.price_list.id}/',
+            {
+                'name': 'Updated Price List',
+                'description': 'Updated pricing',
+                'effective_from': '2026-04-01',
+                'is_active': True,
+                'notes': 'No notes',
+            },
+            format='json',
+            HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
+        )
+
+        self.assertEqual(price_list_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(price_list_response.data['name'], 'Updated Price List')
+
+        quotation_response = self.client.post(
+            '/v1/sale/quotations/',
+            {
+                'party': self.party.id,
+                'business_location': self.warehouse.id,
+                'price_list': self.price_list.id,
+                'quotation_date': '2026-04-30T10:00:00Z',
+                'valid_until': '2026-05-30',
+                'discount_amount': '0.00',
+                'discount_type': 'Fixed',
+                'discount_percent': '0.00',
+                'items': [
+                    {
+                        'item': self.item.id,
+                        'quantity': '2.0000',
+                        'discount': '0.00',
+                    }
+                ],
+            },
+            format='json',
+            HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
+        )
+
+        self.assertEqual(quotation_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(quotation_response.data['grand_total'], '160.00')
+        self.assertEqual(quotation_response.data['items'][0]['rate'], '80.00')
+
+        convert_response = self.client.post(
+            f"/v1/sale/quotations/{quotation_response.data['id']}/convert_to_invoice/",
+            {
+                'invoice_type': 'Tax Invoice',
+                'due_date': '2026-05-30',
+                'notes': 'Converted quote',
+            },
+            format='json',
+            HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
+        )
+
+        self.assertEqual(convert_response.status_code, status.HTTP_200_OK)
+        invoice = Invoice.objects.get(id=convert_response.data['invoice_id'])
+        self.assertEqual(invoice.grand_total, Decimal('160.00'))
+        self.assertEqual(invoice.items.count(), 1)
+        self.assertEqual(invoice.items.first().rate, Decimal('80.00'))
+        invoice.finalize()
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, 'Finalized')
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.current_stock, Decimal('18'))
+        self.assertEqual(StockMovement.objects.filter(source_document_type='sale.InvoiceItem').count(), 1)
+        quotation = Quotation.objects.get(id=quotation_response.data['id'])
+        self.assertEqual(quotation.status, 'Converted')

@@ -1,18 +1,45 @@
 """
 POS application views.
 
-This module exposes the shift and cash transaction workflow used by the
-point-of-sale screen. POS remains organization-scoped and is intentionally
-separate from the storefront commerce layer.
+This module exposes the shift, checkout, and invoice presentation workflow
+used by the point-of-sale screen. POS remains organization-scoped and uses the
+existing sale and stock models for accounting and inventory posting.
 """
 
-from rest_framework import viewsets, status, decorators
-from rest_framework.response import Response
-from django.db.models import Sum
 from decimal import Decimal
-from .models import Shift, CashTransaction
-from .serializers import ShiftSerializer, CashTransactionSerializer
-from configuration.authentication import SUPER_ADMIN_MARKER, ECOMMERCE_MARKER, ScopedRolePermission
+
+from django.core.exceptions import ValidationError
+from rest_framework import decorators, status, viewsets
+from rest_framework.response import Response
+
+from account.models import Organization
+from sale.models import Invoice
+from sale.serializers import OrderSerializer, ReceiptSerializer
+
+from configuration.authentication import (
+    ECOMMERCE_MARKER,
+    SUPER_ADMIN_MARKER,
+    ScopedRolePermission,
+)
+
+from .models import CashTransaction, Shift
+from .serializers import CashTransactionSerializer, POSCheckoutSerializer, ShiftSerializer
+from .services import (
+    build_invoice_document_payload,
+    build_shift_reconciliation,
+    checkout_pos_order,
+)
+
+
+def _get_request_organization(request):
+    if not hasattr(request, 'auth') or request.auth is None or request.auth == ECOMMERCE_MARKER:
+        return None
+    if request.auth == SUPER_ADMIN_MARKER:
+        org_id = request.query_params.get('organization')
+        if not org_id:
+            return None
+        return Organization.objects.filter(pk=org_id).first()
+    return request.auth
 
 
 class ShiftViewSet(viewsets.ModelViewSet):
@@ -115,6 +142,12 @@ class ShiftViewSet(viewsets.ModelViewSet):
             'cash_transactions': shift.transaction_summary
         })
 
+    @decorators.action(detail=True, methods=['get'])
+    def reconciliation(self, request, pk=None):
+        """Return a POS reconciliation snapshot for the shift."""
+        shift = self.get_object()
+        return Response(build_shift_reconciliation(shift))
+
 
 class CashTransactionViewSet(viewsets.ModelViewSet):
     """CRUD viewset for cash transactions during a shift."""
@@ -168,3 +201,94 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         return super().destroy(request, *args, **kwargs)
+
+
+class POSCheckoutViewSet(viewsets.ViewSet):
+    """Create a POS checkout, finalize the invoice, and return receipt data."""
+
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'pos_operations'
+
+    def create(self, request):
+        serializer = POSCheckoutSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        validated = serializer.validated_data
+        shift = validated['shift']
+        business_location = validated.get('business_location') or shift.warehouse
+        party = validated.get('party')
+
+        try:
+            order, invoice, receipt = checkout_pos_order(
+                shift=shift,
+                business_location=business_location,
+                user=request.user,
+                items=validated.get('items'),
+                order_id=validated.get('order_id'),
+                party=party,
+                invoice_type=validated.get('invoice_type', 'Cash'),
+                due_date=validated.get('due_date'),
+                notes=validated.get('notes', ''),
+                terms=validated.get('terms', ''),
+                payment_mode=validated.get('payment_mode', 'Cash'),
+                paid_amount=validated.get('paid_amount', Decimal('0')),
+                reference_number=validated.get('reference_number', ''),
+                receipt_notes=validated.get('receipt_notes', ''),
+                discount_amount=validated.get('discount_amount', Decimal('0')),
+                discount_type=validated.get('discount_type', 'Fixed'),
+            )
+        except ValidationError as exc:
+            detail = exc.message_dict if hasattr(exc, 'message_dict') else {'detail': str(exc)}
+            return Response(detail, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = build_invoice_document_payload(invoice)
+        response = {
+            'order': OrderSerializer(order).data,
+            'invoice': payload,
+            'receipt': ReceiptSerializer(receipt).data if receipt else None,
+        }
+        return Response(response, status=status.HTTP_201_CREATED)
+
+
+class POSInvoiceViewSet(viewsets.ViewSet):
+    """Expose invoice print/share payloads for POS terminals."""
+
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'pos_operations'
+
+    def _get_queryset(self, request):
+        queryset = Invoice.objects.select_related('party', 'business_location', 'billing_state', 'created_by').prefetch_related('items')
+        organization = _get_request_organization(request)
+        if organization is None:
+            if request.auth == SUPER_ADMIN_MARKER:
+                return queryset.none()
+            return queryset.none()
+        return queryset.filter(business_location__organization=organization)
+
+    def retrieve(self, request, pk=None):
+        try:
+            invoice = self._get_queryset(request).get(pk=pk)
+        except Invoice.DoesNotExist:
+            return Response({'detail': 'Invoice not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(build_invoice_document_payload(invoice))
+
+    @decorators.action(detail=True, methods=['get'])
+    def print_data(self, request, pk=None):
+        try:
+            invoice = self._get_queryset(request).get(pk=pk)
+        except Invoice.DoesNotExist:
+            return Response({'detail': 'Invoice not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(build_invoice_document_payload(invoice))
+
+    @decorators.action(detail=True, methods=['get'])
+    def share(self, request, pk=None):
+        try:
+            invoice = self._get_queryset(request).get(pk=pk)
+        except Invoice.DoesNotExist:
+            return Response({'detail': 'Invoice not found.'}, status=status.HTTP_404_NOT_FOUND)
+        payload = build_invoice_document_payload(invoice)
+        return Response({
+            'invoice_id': invoice.id,
+            'invoice_number': invoice.invoice_number,
+            'share': payload['share'],
+        })

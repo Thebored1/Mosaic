@@ -13,6 +13,7 @@ of accounting and tax metadata that must stay stable across workflows.
 """
 
 from rest_framework import serializers
+from decimal import Decimal
 from django.utils import timezone
 from configuration.models import State, Warehouse as BusinessLocation
 from configuration.authentication import SUPER_ADMIN_MARKER
@@ -24,7 +25,9 @@ from .models import (
     PurchaseOrder, PurchaseOrderItem,
     GoodReceiptNote, GRNItem,
     PurchaseInvoice, PurchaseInvoiceItem,
-    DebitNote, PaymentOut
+    DebitNote, PaymentOut,
+    PriceList, PriceListItem,
+    Quotation, QuotationItem,
 )
 
 
@@ -95,6 +98,261 @@ class PartySerializer(serializers.ModelSerializer):
         if validated_data.get('gstin'):
             validated_data['gstin'] = validated_data['gstin'].upper()
         return super().update(instance, validated_data)
+
+
+def resolve_price_list_item(price_list, item, item_variant=None):
+    """
+    Resolve the matching price-list row for a stock item or variant.
+
+    Variant-specific rows win first. If none are found, fall back to the item
+    level default row.
+    """
+    if price_list is None:
+        return None
+    if item_variant is not None:
+        exact = price_list.items.filter(item=item, item_variant=item_variant).first()
+        if exact is not None:
+            return exact
+    return price_list.items.filter(item=item, item_variant__isnull=True).first()
+
+
+class PriceListItemSerializer(serializers.ModelSerializer):
+    """Serialize a priced item inside a price list."""
+
+    item_name = serializers.CharField(source='item.name', read_only=True)
+    item_sku = serializers.CharField(source='item.sku', read_only=True)
+    variant_sku = serializers.CharField(source='item_variant.sku', read_only=True)
+
+    class Meta:
+        model = PriceListItem
+        fields = ['id', 'item', 'item_name', 'item_sku', 'item_variant', 'variant_sku', 'rate', 'notes']
+
+
+class PriceListListSerializer(serializers.ModelSerializer):
+    """Serialize price lists for grid views."""
+
+    organization_id = serializers.IntegerField(source='organization.id', read_only=True)
+
+    class Meta:
+        model = PriceList
+        fields = [
+            'id', 'organization_id', 'name', 'description',
+            'effective_from', 'effective_to', 'is_active',
+            'created_at', 'updated_at',
+        ]
+
+
+class PriceListDetailSerializer(serializers.ModelSerializer):
+    """Serialize a full price list with nested price items."""
+
+    items = PriceListItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = PriceList
+        fields = [
+            'id', 'organization', 'name', 'description',
+            'effective_from', 'effective_to', 'is_active',
+            'notes', 'items', 'created_at', 'updated_at',
+        ]
+
+
+class PriceListCreateSerializer(serializers.ModelSerializer):
+    """Create or update a price list with nested item overrides."""
+
+    items = serializers.ListField(child=serializers.DictField(), write_only=True, required=False)
+
+    class Meta:
+        model = PriceList
+        fields = [
+            'organization', 'name', 'description', 'effective_from',
+            'effective_to', 'is_active', 'notes', 'items',
+        ]
+        extra_kwargs = {
+            'organization': {'required': False},
+        }
+
+    def _build_items(self, price_list, items_data):
+        from stock.models import Item, ItemVariant
+
+        for item_data in items_data:
+            item = Item.objects.get(pk=item_data['item'])
+            item_variant_id = item_data.get('item_variant')
+            item_variant = ItemVariant.objects.get(pk=item_variant_id) if item_variant_id else None
+            if item.organization_id != price_list.organization_id:
+                raise serializers.ValidationError({'items': 'Item does not belong to the price list organization.'})
+            if item_variant_id and item_variant.organization_id != price_list.organization_id:
+                raise serializers.ValidationError({'items': 'Variant does not belong to the price list organization.'})
+            if item_variant_id and item_variant.item_id != item.id:
+                raise serializers.ValidationError({'items': 'Variant must belong to the selected item.'})
+            rate = item_data.get('rate')
+            if rate is None:
+                raise serializers.ValidationError({'items': 'Each price list item requires a rate.'})
+
+            PriceListItem.objects.create(
+                price_list=price_list,
+                item=item,
+                item_variant=item_variant,
+                rate=rate,
+                notes=item_data.get('notes', ''),
+            )
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        price_list = PriceList.objects.create(**validated_data)
+        self._build_items(price_list, items_data)
+        return price_list
+
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop('items', None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        if items_data is not None:
+            instance.items.all().delete()
+            self._build_items(instance, items_data)
+        return instance
+
+
+class QuotationItemSerializer(serializers.ModelSerializer):
+    """Serialize a quoted line item with pricing provenance."""
+
+    item_name = serializers.CharField(source='item.name', read_only=True)
+    item_sku = serializers.CharField(source='item.sku', read_only=True)
+    variant_sku = serializers.CharField(source='item_variant.sku', read_only=True)
+    price_list_item_rate = serializers.DecimalField(source='price_list_item.rate', max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = QuotationItem
+        fields = [
+            'id', 'item', 'item_name', 'item_sku', 'item_variant', 'variant_sku',
+            'price_list_item', 'price_list_item_rate', 'quantity', 'unit',
+            'rate', 'discount', 'line_total', 'notes',
+        ]
+
+
+class QuotationListSerializer(serializers.ModelSerializer):
+    """Serialize quotations for list views."""
+
+    party_name = serializers.CharField(source='party.name', read_only=True)
+    business_location_name = serializers.CharField(source='business_location.legal_name', read_only=True)
+    price_list_name = serializers.CharField(source='price_list.name', read_only=True)
+
+    class Meta:
+        model = Quotation
+        fields = [
+            'id', 'quotation_number', 'party', 'party_name',
+            'business_location', 'business_location_name',
+            'price_list', 'price_list_name',
+            'quotation_date', 'valid_until',
+            'sub_total', 'discount_amount', 'grand_total', 'status',
+        ]
+
+
+class QuotationDetailSerializer(serializers.ModelSerializer):
+    """Serialize a full quotation with nested line items."""
+
+    items = QuotationItemSerializer(many=True, read_only=True)
+    party = PartySerializer(read_only=True)
+    price_list = PriceListListSerializer(read_only=True)
+    converted_order_id = serializers.IntegerField(source='converted_order.id', read_only=True)
+    converted_invoice_id = serializers.IntegerField(source='converted_invoice.id', read_only=True)
+
+    class Meta:
+        model = Quotation
+        fields = [
+            'id', 'quotation_number', 'organization', 'party', 'business_location',
+            'price_list', 'quotation_date', 'valid_until', 'items',
+            'sub_total', 'discount_amount', 'discount_type', 'discount_percent',
+            'grand_total', 'status', 'notes', 'terms',
+            'converted_order_id', 'converted_invoice_id',
+            'created_at', 'updated_at', 'created_by',
+        ]
+
+
+class QuotationCreateSerializer(serializers.ModelSerializer):
+    """Create or update a quotation with nested line items."""
+
+    items = serializers.ListField(child=serializers.DictField(), write_only=True, required=False)
+
+    class Meta:
+        model = Quotation
+        fields = [
+            'organization', 'party', 'business_location', 'price_list',
+            'quotation_date', 'valid_until', 'discount_amount', 'discount_type',
+            'discount_percent', 'notes', 'terms', 'status', 'items',
+        ]
+        extra_kwargs = {
+            'organization': {'required': False},
+        }
+
+    def validate_status(self, value):
+        if value == 'Converted':
+            raise serializers.ValidationError('Converted status is reserved for conversion actions.')
+        return value
+
+    def _build_items(self, quotation, items_data):
+        from stock.models import Item, ItemVariant, Unit
+
+        for item_data in items_data:
+            item = Item.objects.get(pk=item_data['item'])
+            item_variant_id = item_data.get('item_variant')
+            item_variant = ItemVariant.objects.get(pk=item_variant_id) if item_variant_id else None
+            if item.organization_id != quotation.organization_id:
+                raise serializers.ValidationError({'items': 'Item does not belong to the quotation organization.'})
+            if item_variant_id and item_variant.organization_id != quotation.organization_id:
+                raise serializers.ValidationError({'items': 'Variant does not belong to the quotation organization.'})
+            if item_variant_id and item_variant.item_id != item.id:
+                raise serializers.ValidationError({'items': 'Variant must belong to the selected item.'})
+            unit = item_variant.item.unit if item_variant else item.unit
+            price_list_item = resolve_price_list_item(quotation.price_list, item, item_variant)
+
+            explicit_rate = item_data.get('rate')
+            if explicit_rate is not None:
+                rate = Decimal(explicit_rate)
+            elif price_list_item is not None:
+                rate = price_list_item.rate
+            elif item_variant is not None:
+                rate = item_variant.unit_price
+            else:
+                rate = item.unit_price
+
+            quantity = Decimal(item_data.get('quantity', '1'))
+            discount = Decimal(item_data.get('discount', '0'))
+
+            QuotationItem.objects.create(
+                quotation=quotation,
+                item=item,
+                item_variant=item_variant,
+                price_list_item=price_list_item,
+                quantity=quantity,
+                unit=unit,
+                rate=rate,
+                discount=discount,
+                notes=item_data.get('notes', ''),
+            )
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        request = self.context.get('request')
+        if request and request.user and not validated_data.get('created_by'):
+            validated_data['created_by'] = request.user
+        quotation = Quotation.objects.create(**validated_data)
+        self._build_items(quotation, items_data)
+        quotation.recalculate_totals()
+        return quotation
+
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop('items', None)
+        if instance.status in {'Converted', 'Cancelled'}:
+            raise serializers.ValidationError({'quotation': 'Converted or cancelled quotations cannot be edited.'})
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        if items_data is not None:
+            instance.items.all().delete()
+            self._build_items(instance, items_data)
+        instance.recalculate_totals()
+        return instance
 
 
 # ===================== ORDER SERIALIZERS =====================
@@ -281,7 +539,7 @@ class InvoiceDetailSerializer(serializers.ModelSerializer):
             'items', 'sub_total', 'discount_amount', 'discount_type',
             'taxable_amount', 'cgst_amount', 'sgst_amount', 'igst_amount',
             'round_off', 'grand_total', 'tax_summary',
-            'notes', 'terms', 'is_finalized', 'is_cancelled',
+            'notes', 'terms', 'status',
             'e_way_bill', 'order', 'created_at', 'created_by', 'created_by_name'
         ]
 
@@ -361,7 +619,7 @@ class InvoiceCreateSerializer(serializers.ModelSerializer):
                 taxable_amount=taxable
             )
 
-        invoice.save()
+        invoice.calculate_totals()
         return invoice
 
 
@@ -490,7 +748,7 @@ class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PurchaseInvoice
-        fields = ['id', 'invoice_number', 'supplier', 'supplier_name', 'supplier_invoice_number', 'invoice_date', 'grand_total', 'is_finalized']
+        fields = ['id', 'invoice_number', 'supplier', 'supplier_name', 'supplier_invoice_number', 'invoice_date', 'grand_total', 'status']
 
 
 class PurchaseInvoiceDetailSerializer(serializers.ModelSerializer):
@@ -502,7 +760,7 @@ class PurchaseInvoiceDetailSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PurchaseInvoice
-        fields = ['id', 'invoice_number', 'supplier', 'business_location', 'grn', 'purchase_order', 'supplier_invoice_number', 'supplier_invoice_date', 'invoice_date', 'due_date', 'items', 'sub_total', 'discount_amount', 'taxable_amount', 'cgst_amount', 'sgst_amount', 'igst_amount', 'round_off', 'grand_total', 'is_finalized', 'is_cancelled', 'notes', 'created_at']
+        fields = ['id', 'invoice_number', 'supplier', 'business_location', 'grn', 'purchase_order', 'supplier_invoice_number', 'supplier_invoice_date', 'invoice_date', 'due_date', 'items', 'sub_total', 'discount_amount', 'taxable_amount', 'cgst_amount', 'sgst_amount', 'igst_amount', 'round_off', 'grand_total', 'status', 'notes', 'created_at']
 
 
 class DebitNoteSerializer(serializers.ModelSerializer):

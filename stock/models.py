@@ -411,6 +411,12 @@ class Item(OrganizationModel):
     sgst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
     igst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
     has_variants = models.BooleanField(default=False)
+    valuation_method = models.CharField(
+        max_length=10,
+        choices=[('FIFO', 'FIFO'), ('LIFO', 'LIFO')],
+        default='FIFO',
+    )
+    requires_serial_tracking = models.BooleanField(default=False)
     current_stock = models.DecimalField(
         max_digits=12,
         decimal_places=4,
@@ -432,6 +438,11 @@ class Item(OrganizationModel):
             if self.unit.must_be_whole_number and self.current_stock != int(self.current_stock):
                 raise ValidationError({
                     'current_stock': f'Current stock must be a whole number for unit "{self.unit.name}"'
+                })
+        if self.requires_serial_tracking and self.current_stock is not None:
+            if self.current_stock != int(self.current_stock):
+                raise ValidationError({
+                    'current_stock': 'Serialized items must use whole-number stock quantities.'
                 })
 
     def save(self, *args, **kwargs):
@@ -502,6 +513,11 @@ class ItemVariant(OrganizationModel):
             if self.current_stock != int(self.current_stock):
                 raise ValidationError({
                     'current_stock': f'Current stock must be a whole number for unit "{self.item.unit.name}"'
+                })
+        if self.item and self.item.requires_serial_tracking and self.current_stock:
+            if self.current_stock != int(self.current_stock):
+                raise ValidationError({
+                    'current_stock': 'Serialized variants must use whole-number stock quantities.'
                 })
 
     def save(self, *args, **kwargs):
@@ -610,9 +626,17 @@ class Batch(OrganizationModel):
 
     def clean(self):
         super().clean()
+        if self.quantity_received < 0:
+            raise ValidationError({
+                'quantity_received': 'Received quantity cannot be negative'
+            })
         if self.quantity_remaining > self.quantity_received:
             raise ValidationError({
                 'quantity_remaining': 'Remaining quantity cannot exceed received quantity'
+            })
+        if self.quantity_remaining < 0:
+            raise ValidationError({
+                'quantity_remaining': 'Remaining quantity cannot be negative'
             })
 
     def save(self, *args, **kwargs):
@@ -759,6 +783,23 @@ class OpeningStock(OrganizationModel):
     def __str__(self):
         return f'Opening Stock - {self.item.sku}'
 
+    def clean(self):
+        super().clean()
+        if self.item_variant_id and self.item_variant.item_id != self.item_id:
+            raise ValidationError({'item_variant': 'Variant must belong to the selected item.'})
+        if self.quantity < 0:
+            raise ValidationError({'quantity': 'Opening stock quantity cannot be negative.'})
+
+    def approve(self, approved_by=None):
+        from .services import approve_opening_stock
+
+        return approve_opening_stock(self, approved_by=approved_by)
+
+    def reject(self, notes=''):
+        from .services import reject_opening_stock
+
+        return reject_opening_stock(self, notes=notes)
+
 
 class StockMovement(OrganizationModel):
     """
@@ -798,11 +839,23 @@ class StockMovement(OrganizationModel):
         Sale: -5 units @ 55000 each
     """
     MOVEMENT_TYPE_CHOICES = [
+        ('Opening', 'Opening'),
         ('Purchase', 'Purchase'),
         ('Sale', 'Sale'),
         ('Adjustment', 'Adjustment'),
+        ('TransferIn', 'Transfer In'),
+        ('TransferOut', 'Transfer Out'),
+        ('Reserve', 'Reserve'),
+        ('Release', 'Release'),
         ('Return', 'Return'),
         ('Damage', 'Damage'),
+    ]
+
+    POSTING_STATE_CHOICES = [
+        ('Pending', 'Pending'),
+        ('Posted', 'Posted'),
+        ('Reversed', 'Reversed'),
+        ('Failed', 'Failed'),
     ]
 
     STATUS_CHOICES = [
@@ -831,6 +884,13 @@ class StockMovement(OrganizationModel):
         blank=True,
         related_name='stock_movements'
     )
+    warehouse = models.ForeignKey(
+        'configuration.Warehouse',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='warehouse_stock_movements'
+    )
     quantity = models.DecimalField(max_digits=12, decimal_places=4)
     rate = models.DecimalField(max_digits=12, decimal_places=2)
     cgst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
@@ -840,12 +900,40 @@ class StockMovement(OrganizationModel):
     reference_number = models.CharField(max_length=50, blank=True)
     movement_date = models.DateTimeField(auto_now_add=True)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='Pending')
+    posting_state = models.CharField(max_length=10, choices=POSTING_STATE_CHOICES, default='Pending')
+    posted_at = models.DateTimeField(null=True, blank=True)
+    source_document_type = models.CharField(max_length=120, blank=True)
+    source_document_id = models.CharField(max_length=50, blank=True)
+    source_line_reference = models.CharField(max_length=120, blank=True)
+    allocation_data = models.JSONField(default=dict, blank=True)
+    serial_numbers = models.ManyToManyField('SerialNumber', blank=True, related_name='stock_movements')
     notes = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f'{self.movement_type} - {self.item.sku} - {self.quantity}'
+
+    def clean(self):
+        super().clean()
+        if self.item_variant_id and self.item_variant.item_id != self.item_id:
+            raise ValidationError({'item_variant': 'Variant must belong to the selected item.'})
+        if self.warehouse_id and self.organization_id and self.warehouse.organization_id not in {None, self.organization_id}:
+            raise ValidationError({'warehouse': 'Warehouse must belong to the selected organization.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def post(self):
+        from .services import post_existing_stock_movement
+
+        return post_existing_stock_movement(self)
+
+    def reverse(self, reference_number='', notes=''):
+        from .services import reverse_stock_movement
+
+        return reverse_stock_movement(self, reference_number=reference_number, notes=notes)
 
 
 class SerialNumber(OrganizationModel):

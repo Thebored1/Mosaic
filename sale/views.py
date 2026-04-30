@@ -29,13 +29,16 @@ from .models import (
     PurchaseOrder, PurchaseOrderItem,
     GoodReceiptNote, GRNItem,
     PurchaseInvoice, PurchaseInvoiceItem,
-    DebitNote, PaymentOut
+    DebitNote, PaymentOut,
+    PriceList, Quotation
 )
 from .serializers import (
     StateSerializer, BusinessLocationSerializer, PartySerializer,
     OrderSerializer, OrderCreateSerializer,
     InvoiceListSerializer, InvoiceDetailSerializer, InvoiceCreateSerializer,
     InvoiceItemSerializer,
+    PriceListListSerializer, PriceListDetailSerializer, PriceListCreateSerializer,
+    QuotationListSerializer, QuotationDetailSerializer, QuotationCreateSerializer,
     CreditNoteSerializer, ReceiptSerializer, ReceiptCreateSerializer,
     PurchaseOrderListSerializer, PurchaseOrderDetailSerializer,
     GRNListSerializer, GRNDetailSerializer,
@@ -88,24 +91,27 @@ def org_filter(qs, request):
     return qs.none()
 
 
+def finalized_invoices(qs):
+    """Limit a queryset to finalized sales invoices."""
+    return qs.filter(status='Finalized')
+
+
 def save_for_request_organization(serializer, request):
     """Save a model instance under the organization derived from the request."""
     model_fields = {field.name for field in serializer.Meta.model._meta.get_fields()}
     if 'organization' not in model_fields:
-        serializer.save()
-        return
+        return serializer.save()
 
     org_id = request.data.get('organization') or request.query_params.get('organization')
 
     if request.auth == SUPER_ADMIN_MARKER:
         if not org_id:
             raise ValidationError({'organization': 'organization is required for super admin writes'})
-        serializer.save(organization_id=org_id)
-        return
+        return serializer.save(organization_id=org_id)
     if request.auth == ECOMMERCE_MARKER:
         raise ValidationError({'organization': 'Create or join an organization to access this feature'})
 
-    serializer.save(organization=request.auth)
+    return serializer.save(organization=request.auth)
 
 
 def validate_related_organization(request, **relations):
@@ -117,6 +123,12 @@ def validate_related_organization(request, **relations):
 
     for field_name, related_obj in relations.items():
         if related_obj is None:
+            continue
+
+        if field_name == 'organization':
+            related_org_id = getattr(related_obj, 'pk', related_obj)
+            if related_org_id != request.auth.pk:
+                raise ValidationError({field_name: f'{field_name} does not belong to the authenticated organization'})
             continue
 
         related_org_id = getattr(related_obj, 'organization_id', None)
@@ -202,9 +214,9 @@ class PartyViewSet(viewsets.ModelViewSet):
         party = self.get_object()
 
         # Sales invoices
-        invoices = Invoice.objects.filter(
-            party=party, is_finalized=True, is_cancelled=False
-        ).values('invoice_number', 'invoice_date', 'grand_total').annotate(
+        invoices = finalized_invoices(Invoice.objects.filter(party=party)).values(
+            'invoice_number', 'invoice_date', 'grand_total'
+        ).annotate(
             type=('Sales Invoice'), debit=('grand_total'), credit=(0)
         )
 
@@ -292,6 +304,7 @@ class OrderViewSet(viewsets.ModelViewSet):
             return OrderCreateSerializer
         return OrderSerializer
 
+    @transaction.atomic
     def create(self, request, *args, **kwargs):
         """Create a new POS order with nested items."""
         serializer = self.get_serializer(data=request.data, context={'request': request})
@@ -398,8 +411,8 @@ class OrderViewSet(viewsets.ModelViewSet):
             # Create invoice
             invoice_data = {
                 'invoice_type': request.data.get('invoice_type', 'Tax Invoice'),
-                'party': order.party.id if order.party else None,
-                'business_location': order.business_location.id,
+                'party': order.party,
+                'business_location': order.business_location,
                 'due_date': request.data.get('due_date'),
                 'notes': request.data.get('notes', ''),
                 'order': order
@@ -407,7 +420,13 @@ class OrderViewSet(viewsets.ModelViewSet):
 
             # Determine billing state
             if order.party and order.party.state:
-                invoice_data['billing_state'] = order.party.state.id
+                invoice_data['billing_state'] = order.party.state
+            elif getattr(order.business_location, 'state_id', None):
+                invoice_data['billing_state'] = order.business_location.state
+            else:
+                raise ValidationError({
+                    'billing_state': 'A billing state is required to convert a walk-in order.'
+                })
 
             invoice = Invoice.objects.create(**invoice_data)
 
@@ -465,13 +484,13 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     ┌─────────────────────────────────────────────────────────────────────┐
     │  Finalize Invoice: POST /sale/invoices/{id}/finalize/            │
     │                                                                     │
-    │  1. Validates: is_finalized = False                               │
+    │  1. Validates: status = 'Draft'                                 │
     │  2. Credit Check: party.outstanding + grand_total <= credit_limit │
     │  3. For each InvoiceItem:                                         │
     │     - Creates StockMovement (type='Sale')                         │
     │     - Reduces item.current_stock or variant.current_stock         │
     │     - If batch linked: reduces batch.quantity_remaining          │
-    │  4. Updates: is_finalized = True, invoice_date = now              │
+    │  4. Updates: status = 'Finalized', invoice_date = now           │
     │  5. Updates Order: if linked, status = 'Invoiced'                │
     │                                                                     │
     │  After Finalize:                                                   │
@@ -484,18 +503,18 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     ┌─────────────────────────────────────────────────────────────────────┐
     │  Cancel Invoice: POST /sale/invoices/{id}/cancel/                 │
     │                                                                     │
-    │  1. Validates: is_finalized = True                                │
+    │  1. Validates: status = 'Finalized'                              │
     │  2. Creates CreditNote automatically (optional)                   │
     │  3. For each InvoiceItem:                                          │
     │     - Creates StockMovement (type='Return')                       │
     │     - Adds stock back to inventory                                 │
-    │  4. Updates: is_cancelled = True                                  │
+    │  4. Updates: status = 'Cancelled'                                │
     │  5. Keeps audit trail (invoice number preserved, marked cancel)  │
     └─────────────────────────────────────────────────────────────────────┘
 
     Filtering:
     - By party: /sale/invoices/?party=1
-    - By status: /sale/invoices/?is_finalized=true
+    - By status: /sale/invoices/?status=Finalized
     - By date: /sale/invoices/?invoice_date_after=2025-04-01
     - By location: /sale/invoices/?business_location=1
     - Search: /sale/invoices/?search=INV001
@@ -906,11 +925,9 @@ class ReportsViewSet(viewsets.ViewSet):
         """Daily sales summary."""
         date = request.query_params.get('date', timezone.now().date())
 
-        invoices = org_filter(Invoice.objects.filter(
-            invoice_date__date=date,
-            is_finalized=True,
-            is_cancelled=False
-        ), request).aggregate(
+        invoices = org_filter(finalized_invoices(Invoice.objects.filter(
+            invoice_date__date=date
+        )), request).aggregate(
             total_sales=Sum('grand_total'),
             total_tax=Sum('cgst_amount') + Sum('sgst_amount') + Sum('igst_amount'),
             total_items=Count('id')
@@ -936,10 +953,7 @@ class ReportsViewSet(viewsets.ViewSet):
         start_date = request.query_params.get('start_date')
         end_date = request.query_params.get('end_date')
 
-        invoices = org_filter(Invoice.objects.filter(
-            is_finalized=True,
-            is_cancelled=False
-        ), request)
+        invoices = org_filter(finalized_invoices(Invoice.objects.all()), request)
 
         if start_date:
             invoices = invoices.filter(invoice_date__date__gte=start_date)
@@ -963,11 +977,9 @@ class ReportsViewSet(viewsets.ViewSet):
         start_date = request.query_params.get('start_date')
         end_date = request.query_params.get('end_date')
 
-        invoices = org_filter(Invoice.objects.filter(
-            is_finalized=True,
-            is_cancelled=False,
+        invoices = org_filter(finalized_invoices(Invoice.objects.filter(
             invoice_type__in=['Tax Invoice', 'Export', 'SEZ']
-        ), request)
+        )), request)
 
         if start_date:
             invoices = invoices.filter(invoice_date__date__gte=start_date)
@@ -998,17 +1010,207 @@ class ReportsViewSet(viewsets.ViewSet):
         return Response({'gstr1_data': data})
 
 
-class QuotationViewSet(viewsets.ModelViewSet):
-    """Placeholder viewset for quotation CRUD."""
-    # TODO: Implement Quotation/QuotationItem models in sale/models.py
-    # from .models import Quotation, QuotationItem
-    # from .serializers import QuotationSerializer, QuotationDetailSerializer
-    pass
-
-
 class PriceListViewSet(viewsets.ModelViewSet):
-    """Placeholder viewset for price list CRUD."""
-    # TODO: Implement PriceList/PriceListItem models in sale/models.py
-    # from .models import PriceList, PriceListItem
-    # from .serializers import PriceListSerializer, PriceListDetailSerializer
-    pass
+    """CRUD viewset for tenant price lists."""
+
+    queryset = PriceList.objects.all()
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'sales_operations'
+    pagination_class = StandardPagination
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ['is_active', 'effective_from', 'effective_to']
+    search_fields = ['name', 'description']
+    ordering_fields = ['name', 'effective_from', 'created_at']
+    ordering = ['-is_active', 'name']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return PriceListListSerializer
+        if self.action in ['create', 'update', 'partial_update']:
+            return PriceListCreateSerializer
+        return PriceListDetailSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validate_related_organization(
+            request,
+            organization=serializer.validated_data.get('organization'),
+        )
+        price_list = save_for_request_organization(serializer, request)
+        return Response(PriceListDetailSerializer(price_list).data, status=status.HTTP_201_CREATED)
+
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        validate_related_organization(
+            request,
+            organization=serializer.validated_data.get('organization', instance.organization),
+        )
+        price_list = save_for_request_organization(serializer, request)
+        return Response(PriceListDetailSerializer(price_list).data)
+
+
+class QuotationViewSet(viewsets.ModelViewSet):
+    """CRUD viewset for quotations and conversion actions."""
+
+    queryset = Quotation.objects.all()
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'sales_operations'
+    pagination_class = StandardPagination
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ['status', 'party', 'business_location', 'price_list']
+    search_fields = ['quotation_number', 'party__name', 'notes']
+    ordering_fields = ['quotation_date', 'quotation_number', 'grand_total']
+    ordering = ['-quotation_date', '-id']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return QuotationListSerializer
+        if self.action in ['create', 'update', 'partial_update']:
+            return QuotationCreateSerializer
+        return QuotationDetailSerializer
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validate_related_organization(
+            request,
+            organization=serializer.validated_data.get('organization'),
+            party=serializer.validated_data.get('party'),
+            business_location=serializer.validated_data.get('business_location'),
+            price_list=serializer.validated_data.get('price_list'),
+        )
+        quotation = save_for_request_organization(serializer, request)
+        return Response(QuotationDetailSerializer(quotation).data, status=status.HTTP_201_CREATED)
+
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        if instance.status in ['Converted', 'Cancelled']:
+            raise ValidationError({'quotation': 'Converted or cancelled quotations cannot be edited.'})
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        validate_related_organization(
+            request,
+            organization=serializer.validated_data.get('organization', instance.organization),
+            party=serializer.validated_data.get('party', instance.party),
+            business_location=serializer.validated_data.get('business_location', instance.business_location),
+            price_list=serializer.validated_data.get('price_list', instance.price_list),
+        )
+        quotation = save_for_request_organization(serializer, request)
+        return Response(QuotationDetailSerializer(quotation).data)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.status in ['Converted', 'Cancelled']:
+            raise ValidationError({'quotation': 'Converted or cancelled quotations cannot be deleted.'})
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=['post'])
+    def convert_to_order(self, request, pk=None):
+        quotation = self.get_object()
+        if quotation.status not in ['Draft', 'Sent', 'Accepted']:
+            return Response({'error': f'Cannot convert quotation with status {quotation.status}'}, status=status.HTTP_400_BAD_REQUEST)
+        if quotation.converted_order_id or quotation.converted_invoice_id:
+            return Response({'error': 'Quotation has already been converted.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not quotation.items.exists():
+            return Response({'error': 'Quotation must contain at least one item.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            order = Order.objects.create(
+                party=quotation.party,
+                business_location=quotation.business_location,
+                discount_amount=quotation.discount_amount,
+                discount_type=quotation.discount_type,
+                discount_percent=quotation.discount_percent,
+                created_by=request.user,
+            )
+
+            for quotation_item in quotation.items.select_related('item', 'item_variant', 'unit').all():
+                OrderItem.objects.create(
+                    order=order,
+                    item=quotation_item.item,
+                    item_variant=quotation_item.item_variant,
+                    hsn_code=quotation_item.item.tax_code.code if quotation_item.item.tax_code else '',
+                    quantity=quotation_item.quantity,
+                    unit=quotation_item.unit,
+                    rate=quotation_item.rate,
+                    discount=quotation_item.discount,
+                )
+
+            quotation.converted_order = order
+            quotation.status = 'Converted'
+            quotation.save(update_fields=['converted_order', 'status', 'updated_at'])
+
+        return Response({
+            'quotation_id': quotation.id,
+            'quotation_number': quotation.quotation_number,
+            'order_id': order.id,
+            'order_number': order.order_number,
+            'message': 'Quotation converted to order.',
+        })
+
+    @action(detail=True, methods=['post'])
+    def convert_to_invoice(self, request, pk=None):
+        quotation = self.get_object()
+        if quotation.status not in ['Draft', 'Sent', 'Accepted']:
+            return Response({'error': f'Cannot convert quotation with status {quotation.status}'}, status=status.HTTP_400_BAD_REQUEST)
+        if quotation.converted_order_id or quotation.converted_invoice_id:
+            return Response({'error': 'Quotation has already been converted.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not quotation.items.exists():
+            return Response({'error': 'Quotation must contain at least one item.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        billing_state = quotation.party.state if quotation.party and quotation.party.state else quotation.business_location.state
+        if billing_state is None:
+            return Response({'error': 'A billing state is required to convert the quotation.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            invoice = Invoice.objects.create(
+                invoice_type=request.data.get('invoice_type', 'Tax Invoice'),
+                party=quotation.party,
+                billing_state=billing_state,
+                business_location=quotation.business_location,
+                due_date=request.data.get('due_date'),
+                discount_amount=quotation.discount_amount,
+                discount_type='Fixed',
+                notes=request.data.get('notes', quotation.notes),
+                terms=request.data.get('terms', quotation.terms),
+                created_by=request.user,
+            )
+
+            for quotation_item in quotation.items.select_related('item', 'item_variant', 'unit').all():
+                InvoiceItem.objects.create(
+                    invoice=invoice,
+                    item=quotation_item.item,
+                    item_variant=quotation_item.item_variant,
+                    hsn_code=quotation_item.item.tax_code.code if quotation_item.item.tax_code else '',
+                    quantity=quotation_item.quantity,
+                    unit=quotation_item.unit,
+                    rate=quotation_item.rate,
+                    discount=quotation_item.discount,
+                )
+
+            invoice.calculate_totals()
+            quotation.converted_invoice = invoice
+            quotation.status = 'Converted'
+            quotation.save(update_fields=['converted_invoice', 'status', 'updated_at'])
+
+        return Response({
+            'quotation_id': quotation.id,
+            'quotation_number': quotation.quotation_number,
+            'invoice_id': invoice.id,
+            'invoice_number': invoice.invoice_number,
+            'message': 'Quotation converted to invoice.',
+        })

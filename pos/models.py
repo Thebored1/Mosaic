@@ -174,8 +174,7 @@ class Shift(models.Model):
         
         return Invoice.objects.filter(
             warehouse=self.warehouse,
-            is_finalized=True,
-            is_cancelled=False,
+            status='Finalized',
             created_by=self.user,
             invoice_date__gte=self.opening_time,
             invoice_date__lte=(self.closing_time or timezone.now())

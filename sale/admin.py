@@ -7,7 +7,9 @@ from .models import (
     PurchaseOrder, PurchaseOrderItem,
     GoodReceiptNote, GRNItem,
     PurchaseInvoice, PurchaseInvoiceItem,
-    DebitNote, PaymentOut
+    DebitNote, PaymentOut,
+    PriceList, PriceListItem,
+    Quotation, QuotationItem
 )
 
 
@@ -108,3 +110,29 @@ class PaymentOutAdmin(admin.ModelAdmin):
     list_display = ['payment_number', 'supplier', 'amount', 'payment_mode', 'transaction_date']
     list_filter = ['payment_mode', 'business_location']
     search_fields = ['payment_number']
+
+
+class PriceListItemInline(admin.TabularInline):
+    model = PriceListItem
+    extra = 0
+
+
+@admin.register(PriceList)
+class PriceListAdmin(admin.ModelAdmin):
+    list_display = ['name', 'organization', 'effective_from', 'effective_to', 'is_active']
+    list_filter = ['is_active', 'effective_from', 'effective_to']
+    search_fields = ['name']
+    inlines = [PriceListItemInline]
+
+
+class QuotationItemInline(admin.TabularInline):
+    model = QuotationItem
+    extra = 0
+
+
+@admin.register(Quotation)
+class QuotationAdmin(admin.ModelAdmin):
+    list_display = ['quotation_number', 'party', 'business_location', 'status', 'grand_total', 'quotation_date']
+    list_filter = ['status', 'business_location', 'price_list']
+    search_fields = ['quotation_number', 'party__name']
+    inlines = [QuotationItemInline]

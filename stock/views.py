@@ -14,6 +14,8 @@ most tenancy-sensitive parts of the application.
 """
 
 from rest_framework import viewsets
+from rest_framework.response import Response
+from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
@@ -35,6 +37,7 @@ from .serializers import (
     OpeningStockSerializer, StockMovementSerializer,
     SerialNumberSerializer
 )
+from .services import approve_opening_stock, post_existing_stock_movement, reject_opening_stock, reverse_stock_movement
 
 
 class StandardPagination(PageNumberPagination):
@@ -527,6 +530,20 @@ class OpeningStockViewSet(viewsets.ModelViewSet):
         validate_serializer_relations(serializer, self.request)
         save_for_request_organization(serializer, self.request)
 
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        """Approve and post an opening stock record."""
+        opening_stock = self.get_object()
+        approve_opening_stock(opening_stock, approved_by=request.user)
+        return Response(OpeningStockSerializer(opening_stock).data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """Reject an opening stock record without posting inventory."""
+        opening_stock = self.get_object()
+        reject_opening_stock(opening_stock, notes=request.data.get('notes', ''))
+        return Response(OpeningStockSerializer(opening_stock).data)
+
 
 class StockMovementViewSet(viewsets.ModelViewSet):
     """
@@ -541,7 +558,7 @@ class StockMovementViewSet(viewsets.ModelViewSet):
     permission_scope = 'inventory_control'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ['status', 'movement_type', 'item']
+    filterset_fields = ['status', 'posting_state', 'movement_type', 'item', 'warehouse']
     search_fields = ['reference_number', 'item__sku']
     ordering_fields = ['movement_date', 'id']
     ordering = ['-movement_date']
@@ -557,6 +574,24 @@ class StockMovementViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         """Update a stock movement under the tenant."""
         save_for_request_organization(serializer, self.request)
+
+    @action(detail=True, methods=['post'])
+    def post(self, request, pk=None):
+        """Post a pending stock movement into inventory."""
+        movement = self.get_object()
+        post_existing_stock_movement(movement)
+        return Response(StockMovementSerializer(movement).data)
+
+    @action(detail=True, methods=['post'])
+    def reverse(self, request, pk=None):
+        """Reverse a posted stock movement."""
+        movement = self.get_object()
+        reversal = reverse_stock_movement(
+            movement,
+            reference_number=request.data.get('reference_number', ''),
+            notes=request.data.get('notes', ''),
+        )
+        return Response(StockMovementSerializer(reversal).data, status=201)
 
 
 class SerialNumberViewSet(viewsets.ModelViewSet):

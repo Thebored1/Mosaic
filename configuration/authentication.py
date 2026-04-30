@@ -39,6 +39,12 @@ ACTION_ALIASES = {
     'summary': 'read',
     'ledger': 'read',
     'print_data': 'read',
+    'share': 'read',
+    'reconciliation': 'read',
+    'timeline': 'read',
+    'request_trace': 'read',
+    'entity_timeline': 'read',
+    'user_activity': 'read',
     'daily_sales': 'read',
     'gst_register': 'read',
     'gstr1': 'read',
@@ -49,6 +55,8 @@ ACTION_ALIASES = {
     'hold': 'write',
     'recall': 'write',
     'convert': 'write',
+    'convert_to_order': 'write',
+    'convert_to_invoice': 'write',
     'finalize': 'write',
     'close': 'write',
     'cancel': 'write',
@@ -150,6 +158,9 @@ ROLE_POLICIES = {
         'delete': MANAGEMENT_ROLES,
     },
     'commerce_audit': {
+        'read': MANAGEMENT_ROLES,
+    },
+    'audit_read': {
         'read': MANAGEMENT_ROLES,
     },
     'marketplace_settlement': {

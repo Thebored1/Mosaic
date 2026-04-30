@@ -27,6 +27,7 @@ The items below are intentionally left for later so the current backend can stay
 - Release reserved stock when an order is abandoned or payment never arrives.
 - Send notifications for order placement, shipment, return receipt, and payout updates.
 - Retry failed side effects such as settlement state transitions or future gateway callbacks.
+- Add worker-based handling for return aging, refund retries, and settlement reconciliation.
 
 ## Priority 3: Storefront UX
 
@@ -50,6 +51,15 @@ The items below are intentionally left for later so the current backend can stay
   - tracking sync
   - shipping webhooks
   - split shipment handling
+
+## Returns and Refunds Today
+
+- Returns are already supported through the API, but they are processed manually.
+- A return request moves through `requested -> received -> processed`.
+- When a seller processes a return, stock is restocked immediately in the request cycle.
+- Refunds are stored as separate records and are also processed manually.
+- There is no payment-gateway refund callback or automated refund worker yet.
+- There is no background job that auto-closes stale returns or retries failed refund steps.
 
 ## Priority 6: Payment Gateway Integration
 
@@ -79,5 +89,7 @@ The backend now has the commerce primitives required for a real ecommerce platfo
 - async/background processing
 - payment gateway wiring
 - operational polish
+
+Returns and refunds are present, but the automation around them is still missing.
 
 Those can be added later without reworking the current identity or commerce model.

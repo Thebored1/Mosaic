@@ -25,8 +25,8 @@ from .views import (
     PurchaseInvoiceViewSet, DebitNoteViewSet, PaymentOutViewSet,
     # Reports
     ReportsViewSet,
-    # Quotations & Price Lists (TODO: Implement models first)
-    # QuotationViewSet, PriceListViewSet
+    # Pricing and quotations
+    PriceListViewSet, QuotationViewSet,
 )
 
 
@@ -77,7 +77,7 @@ router.register(r'orders', OrderViewSet, basename='orders')
 # POST /sale/invoices/{id}/finalize/ - Finalize & deduct stock
 # POST /sale/invoices/{id}/cancel/ - Cancel invoice
 # GET /sale/invoices/{id}/print/ - Print-friendly data
-# Filtering: /sale/invoices/?party=1&is_finalized=true&business_location=1
+# Filtering: /sale/invoices/?party=1&status=Finalized&business_location=1
 router.register(r'invoices', InvoiceViewSet, basename='invoices')
 
 # Receipts (Payments Received)
@@ -137,11 +137,11 @@ router.register(r'payments-out', PaymentOutViewSet, basename='payments-out')
 # GET /sale/reports/gstr1/?start_date=2025-04-01&end_date=2025-04-30
 router.register(r'reports', ReportsViewSet, basename='reports')
 
-# Quotations (TODO: Implement models first)
-# router.register(r'quotations', QuotationViewSet, basename='quotations')
+# Quotations
+router.register(r'quotations', QuotationViewSet, basename='quotations')
 
-# Price Lists (TODO: Implement models first)
-# router.register(r'price-lists', PriceListViewSet, basename='price-lists')
+# Price Lists
+router.register(r'price-lists', PriceListViewSet, basename='price-lists')
 
 
 urlpatterns = [

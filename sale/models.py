@@ -14,9 +14,10 @@ models carry the tax and accounting state needed by those workflows.
 """
 
 from decimal import Decimal
-from django.db import models
+from django.db import models, transaction
 from django.db.models import F
 from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator
 from django.utils import timezone
 from django.contrib.auth.models import User
 
@@ -176,6 +177,320 @@ class Party(models.Model):
         purchase_outstanding = purchase_invoiced - purchase_paid - purchase_debits
 
         return self.opening_balance + sales_outstanding - purchase_outstanding
+
+
+def quantize_money(value):
+    """Round money values to two decimals for stored totals."""
+    return Decimal(value).quantize(Decimal('0.01'))
+
+
+class PriceList(models.Model):
+    """
+    Tenant-scoped item price overrides.
+
+    A price list captures a time-bound catalog of item prices that can be used
+    by quotations and other sales documents without mutating stock masters.
+    """
+
+    organization = models.ForeignKey(
+        'account.Organization',
+        on_delete=models.CASCADE,
+        related_name='price_lists',
+    )
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    effective_from = models.DateField(default=timezone.localdate)
+    effective_to = models.DateField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Price List'
+        verbose_name_plural = 'Price Lists'
+        ordering = ['-is_active', 'name']
+
+    def __str__(self):
+        return self.name
+
+    def clean(self):
+        super().clean()
+        if self.effective_to and self.effective_to < self.effective_from:
+            raise ValidationError({'effective_to': 'Effective end date cannot be before the start date.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def get_item_price(self, item, item_variant=None):
+        """
+        Resolve the configured rate for a stock item or variant.
+
+        Variant-specific overrides win first. If no exact variant override
+        exists, fall back to an item-level override.
+        """
+        queryset = self.items.all()
+        if item_variant is not None:
+            exact = queryset.filter(item=item, item_variant=item_variant).first()
+            if exact is not None:
+                return exact
+        return queryset.filter(item=item, item_variant__isnull=True).first()
+
+
+class PriceListItem(models.Model):
+    """
+    One priced item inside a price list.
+
+    The item is linked to a stock master record and stores the override rate
+    that quotation flows can snapshot into customer-facing documents.
+    """
+
+    price_list = models.ForeignKey(
+        PriceList,
+        on_delete=models.CASCADE,
+        related_name='items',
+    )
+    item = models.ForeignKey(
+        'stock.Item',
+        on_delete=models.CASCADE,
+        related_name='price_list_items',
+    )
+    item_variant = models.ForeignKey(
+        'stock.ItemVariant',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='price_list_items',
+    )
+    rate = models.DecimalField(max_digits=12, decimal_places=2, validators=[MinValueValidator(0)])
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Price List Item'
+        verbose_name_plural = 'Price List Items'
+        unique_together = ['price_list', 'item', 'item_variant']
+
+    def __str__(self):
+        return f'{self.price_list.name} - {self.item.sku}'
+
+    def clean(self):
+        super().clean()
+        if self.item.organization_id != self.price_list.organization_id:
+            raise ValidationError({'item': 'Item does not belong to this price list organization.'})
+        if self.item_variant_id:
+            if self.item_variant.item_id != self.item_id:
+                raise ValidationError({'item_variant': 'Variant must belong to the selected item.'})
+            if self.item_variant.organization_id != self.price_list.organization_id:
+                raise ValidationError({'item_variant': 'Variant does not belong to this price list organization.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class Quotation(models.Model):
+    """
+    Draft sales quote used before order or invoice conversion.
+
+    Quotations snapshot price-list driven rates and keep the eventual sales
+    document immutable after conversion.
+    """
+
+    STATUS_CHOICES = [
+        ('Draft', 'Draft'),
+        ('Sent', 'Sent'),
+        ('Accepted', 'Accepted'),
+        ('Rejected', 'Rejected'),
+        ('Converted', 'Converted'),
+        ('Cancelled', 'Cancelled'),
+    ]
+
+    quotation_number = models.CharField(max_length=30, unique=True)
+    organization = models.ForeignKey(
+        'account.Organization',
+        on_delete=models.CASCADE,
+        related_name='quotations',
+    )
+    party = models.ForeignKey(
+        'sale.Party',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quotations',
+    )
+    business_location = models.ForeignKey(
+        'configuration.Warehouse',
+        on_delete=models.PROTECT,
+        related_name='quotations',
+    )
+    price_list = models.ForeignKey(
+        PriceList,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quotations',
+    )
+    quotation_date = models.DateTimeField(default=timezone.now)
+    valid_until = models.DateField(null=True, blank=True)
+    sub_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    discount_type = models.CharField(
+        max_length=10,
+        choices=[('Percentage', 'Percentage'), ('Fixed', 'Fixed')],
+        default='Fixed'
+    )
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'), blank=True)
+    grand_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Draft')
+    notes = models.TextField(blank=True)
+    terms = models.TextField(blank=True)
+    converted_order = models.OneToOneField(
+        'Order',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='source_quotation',
+    )
+    converted_invoice = models.OneToOneField(
+        'Invoice',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='source_quotation',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='quotations_created',
+    )
+
+    class Meta:
+        verbose_name = 'Quotation'
+        verbose_name_plural = 'Quotations'
+        ordering = ['-quotation_date', '-id']
+
+    def __str__(self):
+        return f'{self.quotation_number} - {self.grand_total}'
+
+    def save(self, *args, **kwargs):
+        if not self.quotation_number:
+            self.quotation_number = self.generate_quotation_number()
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def generate_quotation_number(self):
+        prefix = f"QT{timezone.now().strftime('%Y%m%d')}"
+        last = Quotation.objects.filter(quotation_number__startswith=prefix).order_by('-quotation_number').first()
+        if last:
+            try:
+                num = int(last.quotation_number[-4:])
+                return f"{prefix}{num + 1:04d}"
+            except ValueError:
+                pass
+        return f"{prefix}0001"
+
+    def recalculate_totals(self):
+        subtotal = quantize_money(sum((item.line_total for item in self.items.all()), Decimal('0')))
+        self.sub_total = subtotal
+        if self.discount_type == 'Percentage':
+            self.discount_amount = quantize_money(subtotal * self.discount_percent / 100)
+        self.grand_total = quantize_money(subtotal - self.discount_amount)
+        self.save(update_fields=['sub_total', 'discount_amount', 'grand_total', 'updated_at'])
+
+
+    def clean(self):
+        super().clean()
+        if self.valid_until and self.valid_until < self.quotation_date.date():
+            raise ValidationError({'valid_until': 'Valid until cannot be earlier than the quotation date.'})
+
+
+class QuotationItem(models.Model):
+    """
+    One quoted line item.
+
+    Rates are copied from the selected price list or from the stock master at
+    creation time so future price changes do not rewrite the quote.
+    """
+
+    quotation = models.ForeignKey(
+        Quotation,
+        on_delete=models.CASCADE,
+        related_name='items',
+    )
+    item = models.ForeignKey(
+        'stock.Item',
+        on_delete=models.PROTECT,
+        related_name='quotation_items',
+    )
+    item_variant = models.ForeignKey(
+        'stock.ItemVariant',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quotation_items',
+    )
+    price_list_item = models.ForeignKey(
+        PriceListItem,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quotation_items',
+    )
+    quantity = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        validators=[MinValueValidator(Decimal('0.0001'))],
+    )
+    unit = models.ForeignKey(
+        'stock.Unit',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='quotation_items',
+    )
+    rate = models.DecimalField(max_digits=12, decimal_places=2)
+    discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    line_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Quotation Item'
+        verbose_name_plural = 'Quotation Items'
+        unique_together = ['quotation', 'item', 'item_variant']
+
+    def __str__(self):
+        return f'{self.quotation.quotation_number} - {self.item.sku}'
+
+    def clean(self):
+        super().clean()
+        if self.quotation_id and self.quotation.status in {'Converted', 'Cancelled'}:
+            raise ValidationError({'quotation': 'Converted or cancelled quotations cannot be edited.'})
+        if self.item.organization_id != self.quotation.organization_id:
+            raise ValidationError({'item': 'Item does not belong to the quotation organization.'})
+        if self.item_variant_id:
+            if self.item_variant.item_id != self.item_id:
+                raise ValidationError({'item_variant': 'Variant must belong to the selected item.'})
+            if self.item_variant.organization_id != self.quotation.organization_id:
+                raise ValidationError({'item_variant': 'Variant does not belong to the quotation organization.'})
+
+    def save(self, *args, **kwargs):
+        self.line_total = quantize_money((self.quantity * self.rate) - self.discount)
+        self.full_clean()
+        super().save(*args, **kwargs)
+        self.quotation.recalculate_totals()
+
+    def delete(self, *args, **kwargs):
+        quotation = self.quotation
+        super().delete(*args, **kwargs)
+        quotation.recalculate_totals()
 
 
 class Order(models.Model):
@@ -639,6 +954,61 @@ class Invoice(models.Model):
             self.billing_state = self.party.state
         super().save(*args, **kwargs)
 
+    def calculate_totals(self):
+        """
+        Recalculate invoice totals from the stored line items.
+
+        The invoice keeps line-item tax snapshots, so the parent totals can be
+        rebuilt from the immutable child records at any time.
+        """
+        items = list(self.items.all())
+        sub_total = quantize_money(sum((item.taxable_amount for item in items), Decimal('0')))
+        taxable_amount = quantize_money(sub_total - self.discount_amount)
+
+        cgst_amount = quantize_money(sum((item.cgst_amount for item in items), Decimal('0')))
+        sgst_amount = quantize_money(sum((item.sgst_amount for item in items), Decimal('0')))
+        igst_amount = quantize_money(sum((item.igst_amount for item in items), Decimal('0')))
+        cess_amount = quantize_money(sum((item.cess_amount for item in items), Decimal('0')))
+
+        summary = {}
+        for item in items:
+            if item.igst_amount and not item.cgst_amount and not item.sgst_amount:
+                rate_key = str(item.igst_rate)
+            else:
+                rate_key = str(item.cgst_rate + item.sgst_rate)
+            bucket = summary.setdefault(
+                rate_key,
+                {'taxable': Decimal('0'), 'cgst': Decimal('0'), 'sgst': Decimal('0'), 'igst': Decimal('0')}
+            )
+            bucket['taxable'] += item.taxable_amount
+            bucket['cgst'] += item.cgst_amount
+            bucket['sgst'] += item.sgst_amount
+            bucket['igst'] += item.igst_amount
+
+        self.sub_total = sub_total
+        self.taxable_amount = taxable_amount
+        self.cgst_amount = cgst_amount
+        self.sgst_amount = sgst_amount
+        self.igst_amount = igst_amount
+        self.round_off = quantize_money(self.round_off or Decimal('0'))
+        self.grand_total = quantize_money(taxable_amount + cgst_amount + sgst_amount + igst_amount + cess_amount + self.round_off)
+        self.tax_summary = {
+            rate: {key: str(quantize_money(value)) for key, value in values.items()}
+            for rate, values in summary.items()
+        }
+        self.save(update_fields=[
+            'sub_total',
+            'discount_amount',
+            'taxable_amount',
+            'cgst_amount',
+            'sgst_amount',
+            'igst_amount',
+            'round_off',
+            'grand_total',
+            'tax_summary',
+            'updated_at',
+        ])
+
     def finalize(self):
         """
         Finalize invoice - deduct stock, update party outstanding.
@@ -653,40 +1023,46 @@ class Invoice(models.Model):
         4. Update Order status to 'Invoiced' (if linked)
         5. Create Receipt if payment captured (optional)
         """
-        if self.status != 'Draft':
-            raise ValidationError(f"Cannot finalize invoice with status '{self.status}'")
+        with transaction.atomic():
+            if self.status != 'Draft':
+                raise ValidationError(f"Cannot finalize invoice with status '{self.status}'")
 
-        if not self.invoice_number:
-            self.invoice_number = self.business_location.get_next_invoice_number()
+            if not self.invoice_number:
+                self.invoice_number = self.business_location.get_next_invoice_number()
 
-        self.status = 'Finalized'
-        self.invoice_date = timezone.now()
-        self.save(update_fields=['status', 'invoice_date', 'invoice_number'])
+            self.status = 'Finalized'
+            self.invoice_date = timezone.now()
+            self.save(update_fields=['status', 'invoice_date', 'invoice_number'])
 
-        # Deduct stock via StockMovement
-        from stock.models import StockMovement
-        for item in self.items.all():
-            stock_kwargs = {
-                'movement_type': 'Sale',
-                'item': item.item,
-                'item_variant': item.item_variant,
-                'quantity': item.quantity,
-                'rate': item.rate,
-                'cgst_rate': item.cgst_rate,
-                'sgst_rate': item.sgst_rate,
-                'igst_rate': item.igst_rate,
-                'total_amount': item.total,
-                'reference_number': self.invoice_number,
-                'status': 'Approved',
-            }
-            if item.batch:
-                stock_kwargs['batch'] = item.batch
-            StockMovement.objects.create(**stock_kwargs)
+            from stock.services import post_stock_movement
 
-        # Update order status
-        if self.order:
-            self.order.status = 'Invoiced'
-            self.order.save(update_fields=['status'])
+            organization = self.business_location.organization
+            for item in self.items.all():
+                post_stock_movement(
+                    organization=organization,
+                    movement_type='Sale',
+                    item=item.item,
+                    item_variant=item.item_variant,
+                    batch=item.batch,
+                    warehouse=self.business_location,
+                    quantity=item.quantity,
+                    rate=item.rate,
+                    cgst_rate=item.cgst_rate,
+                    sgst_rate=item.sgst_rate,
+                    igst_rate=item.igst_rate,
+                    total_amount=item.total,
+                    reference_number=self.invoice_number,
+                    status='Approved',
+                    source_document_type='sale.InvoiceItem',
+                    source_document_id=item.pk,
+                    source_line_reference=item.pk,
+                    notes='Invoice finalization',
+                )
+
+            # Update order status
+            if self.order:
+                self.order.status = 'Invoiced'
+                self.order.save(update_fields=['status'])
 
     def cancel(self, user):
         """
@@ -699,27 +1075,47 @@ class Invoice(models.Model):
            - Create StockMovement (Return type, add stock back)
         4. Update Party outstanding
         """
-        if self.status != 'Finalized':
-            raise ValidationError("Can only cancel finalized invoices")
+        with transaction.atomic():
+            if self.status != 'Finalized':
+                raise ValidationError("Can only cancel finalized invoices")
 
-        self.status = 'Cancelled'
-        self.cancelled_by = user
-        self.cancelled_at = timezone.now()
-        self.save(update_fields=['status', 'cancelled_by', 'cancelled_at'])
+            self.status = 'Cancelled'
+            self.cancelled_by = user
+            self.cancelled_at = timezone.now()
+            self.save(update_fields=['status', 'cancelled_by', 'cancelled_at'])
 
-        # Reverse stock
-        from stock.models import StockMovement
-        for item in self.items.all():
-            stock_kwargs = {
-                'movement_type': 'Return',
-                'item': item.item,
-                'item_variant': item.item_variant,
-                'quantity': item.quantity,
-                'rate': item.rate,
-                'reference_number': f"CN-{self.invoice_number}",
-                'status': 'Approved',
-            }
-            StockMovement.objects.create(**stock_kwargs)
+            from stock.models import StockMovement
+            from stock.services import reverse_stock_movement, post_stock_movement
+
+            for item in self.items.all():
+                movement = StockMovement.objects.filter(
+                    source_document_type='sale.InvoiceItem',
+                    source_document_id=str(item.pk),
+                    movement_type='Sale',
+                    status='Approved',
+                ).order_by('-created_at').first()
+                if movement is not None:
+                    reverse_stock_movement(
+                        movement,
+                        reference_number=f'CN-{self.invoice_number}',
+                        notes='Invoice cancellation',
+                    )
+                else:
+                    post_stock_movement(
+                        organization=self.business_location.organization,
+                        movement_type='Return',
+                        item=item.item,
+                        item_variant=item.item_variant,
+                        warehouse=self.business_location,
+                        quantity=item.quantity,
+                        rate=item.rate,
+                        reference_number=f'CN-{self.invoice_number}',
+                        status='Approved',
+                        source_document_type='sale.InvoiceItem',
+                        source_document_id=item.pk,
+                        source_line_reference=item.pk,
+                        notes='Invoice cancellation',
+                    )
 
 
 class InvoiceItem(models.Model):
@@ -865,6 +1261,13 @@ class InvoiceItem(models.Model):
 
         self.cess_amount = self.taxable_amount * self.cess_rate / 100
         self.total = self.taxable_amount + self.cgst_amount + self.sgst_amount + self.igst_amount + self.cess_amount
+
+
+    def save(self, *args, **kwargs):
+        self.calculate_totals()
+        super().save(*args, **kwargs)
+        if self.invoice_id:
+            self.invoice.calculate_totals()
 
 
 class CreditNote(models.Model):
@@ -1567,28 +1970,36 @@ class PurchaseInvoice(models.Model):
 
     def finalize(self):
         """Finalize purchase invoice - add stock (Purchase type movement)."""
-        if self.status != 'Draft':
-            raise ValidationError(f"Cannot finalize purchase invoice with status '{self.status}'")
+        with transaction.atomic():
+            if self.status != 'Draft':
+                raise ValidationError(f"Cannot finalize purchase invoice with status '{self.status}'")
 
-        self.status = 'Finalized'
-        self.save(update_fields=['status'])
+            self.status = 'Finalized'
+            self.save(update_fields=['status'])
 
-        from stock.models import StockMovement
-        for item in self.items.all():
-            stock_kwargs = {
-                'movement_type': 'Purchase',
-                'item': item.item,
-                'item_variant': item.item_variant,
-                'quantity': item.quantity,
-                'rate': item.rate,
-                'cgst_rate': item.cgst_rate,
-                'sgst_rate': item.sgst_rate,
-                'igst_rate': item.igst_rate,
-                'total_amount': item.total,
-                'reference_number': self.invoice_number,
-                'status': 'Approved',
-            }
-            StockMovement.objects.create(**stock_kwargs)
+            from stock.services import post_stock_movement
+
+            organization = self.business_location.organization
+            for item in self.items.all():
+                post_stock_movement(
+                    organization=organization,
+                    movement_type='Purchase',
+                    item=item.item,
+                    item_variant=item.item_variant,
+                    warehouse=self.business_location,
+                    quantity=item.quantity,
+                    rate=item.rate,
+                    cgst_rate=item.cgst_rate,
+                    sgst_rate=item.sgst_rate,
+                    igst_rate=item.igst_rate,
+                    total_amount=item.total,
+                    reference_number=self.invoice_number,
+                    status='Approved',
+                    source_document_type='sale.PurchaseInvoiceItem',
+                    source_document_id=item.pk,
+                    source_line_reference=item.pk,
+                    notes='Purchase invoice finalization',
+                )
 
 
 class PurchaseInvoiceItem(models.Model):

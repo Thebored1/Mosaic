@@ -49,7 +49,7 @@ class TaxComponentAdmin(admin.ModelAdmin):
 
 @admin.register(Item)
 class ItemAdmin(admin.ModelAdmin):
-    list_display = ('name', 'sku', 'category', 'unit', 'tax_code', 'has_variants', 'current_stock', 'unit_price', 'is_active')
+    list_display = ('name', 'sku', 'category', 'unit', 'tax_code', 'has_variants', 'valuation_method', 'requires_serial_tracking', 'current_stock', 'unit_price', 'is_active')
     search_fields = ('name', 'sku')
     list_filter = ('is_active', 'category', 'unit', 'has_variants')
     ordering = ('name',)
@@ -92,9 +92,9 @@ class OpeningStockAdmin(admin.ModelAdmin):
 
 @admin.register(StockMovement)
 class StockMovementAdmin(admin.ModelAdmin):
-    list_display = ('movement_type', 'item', 'item_variant', 'quantity', 'rate', 'status', 'movement_date')
-    list_filter = ('movement_type', 'status', 'movement_date')
-    search_fields = ('item__sku', 'reference_number')
+    list_display = ('movement_type', 'item', 'item_variant', 'warehouse', 'quantity', 'rate', 'status', 'posting_state', 'movement_date')
+    list_filter = ('movement_type', 'status', 'posting_state', 'movement_date')
+    search_fields = ('item__sku', 'reference_number', 'source_document_id')
 
 
 @admin.register(SerialNumber)

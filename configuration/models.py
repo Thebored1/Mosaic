@@ -261,7 +261,9 @@ class ApiToken(models.Model):
 
     def __str__(self):
         """Return a human-readable token label."""
-        return f"Token - {self.user_account.user.username} ({self.user_account.organization.name})"
+        organization = getattr(self.user_account, 'organization', None)
+        organization_name = organization.name if organization is not None else 'No Organization'
+        return f"Token - {self.user_account.user.username} ({organization_name})"
 
 
 class SuperAdminToken(models.Model):

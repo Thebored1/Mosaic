@@ -5,7 +5,13 @@ This module shapes the shift and cash transaction payloads used by the POS
 screen and its supporting admin workflows.
 """
 
+from decimal import Decimal
+
 from rest_framework import serializers
+
+from configuration.models import Warehouse
+from sale.models import Party
+
 from .models import Shift, CashTransaction
 
 
@@ -96,4 +102,47 @@ class ShiftSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 'opening_cash': 'Opening cash is required to open a shift'
             })
+        return attrs
+
+
+class POSCheckoutSerializer(serializers.Serializer):
+    """Validate a POS checkout request."""
+
+    shift = serializers.PrimaryKeyRelatedField(queryset=Shift.objects.all())
+    order_id = serializers.IntegerField(required=False)
+    business_location = serializers.PrimaryKeyRelatedField(
+        queryset=Warehouse.objects.all(),
+        required=False,
+    )
+    party = serializers.PrimaryKeyRelatedField(
+        queryset=Party.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    items = serializers.ListField(child=serializers.DictField(), required=False)
+    discount_amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=Decimal('0'))
+    discount_type = serializers.ChoiceField(choices=[('Percentage', 'Percentage'), ('Fixed', 'Fixed')], required=False, default='Fixed')
+    hold_notes = serializers.CharField(required=False, allow_blank=True, default='')
+    invoice_type = serializers.CharField(required=False, default='Cash')
+    due_date = serializers.DateField(required=False, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True, default='')
+    terms = serializers.CharField(required=False, allow_blank=True, default='')
+    payment_mode = serializers.ChoiceField(
+        choices=[
+            ('Cash', 'Cash'),
+            ('Card', 'Card'),
+            ('UPI', 'UPI'),
+            ('Bank Transfer', 'Bank Transfer'),
+            ('Credit', 'Credit'),
+        ],
+        required=False,
+        default='Cash',
+    )
+    paid_amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=Decimal('0'))
+    reference_number = serializers.CharField(required=False, allow_blank=True, default='')
+    receipt_notes = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate(self, attrs):
+        if not attrs.get('order_id') and not attrs.get('items'):
+            raise serializers.ValidationError({'items': 'Provide order_id or at least one item for POS checkout.'})
         return attrs

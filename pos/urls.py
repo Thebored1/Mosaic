@@ -11,7 +11,7 @@ Endpoint Summary:
 
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import ShiftViewSet, CashTransactionViewSet
+from .views import CashTransactionViewSet, POSCheckoutViewSet, POSInvoiceViewSet, ShiftViewSet
 
 
 router = DefaultRouter()
@@ -30,6 +30,14 @@ router.register(r'shifts', ShiftViewSet, basename='shifts')
 # GET /transactions/{id}/ - Get transaction
 # DELETE /transactions/{id}/ - Delete transaction
 router.register(r'transactions', CashTransactionViewSet, basename='transactions')
+
+# POS orchestration endpoints
+# POST /checkout/ - Create order, invoice, stock posting, and receipt data
+router.register(r'checkout', POSCheckoutViewSet, basename='pos-checkout')
+# GET /invoices/{id}/ - Get invoice payload
+# GET /invoices/{id}/print_data/ - Get print payload
+# GET /invoices/{id}/share/ - Get share payload
+router.register(r'invoices', POSInvoiceViewSet, basename='pos-invoices')
 
 
 urlpatterns = [
