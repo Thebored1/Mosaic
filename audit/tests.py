@@ -1,3 +1,5 @@
+"""Smoke tests for the audit trail."""
+
 from django.http import HttpResponse
 from django.test import RequestFactory, TransactionTestCase
 
@@ -8,14 +10,18 @@ from configuration.models import State, Warehouse
 
 
 class AuditTrailTests(TransactionTestCase):
+    """Verify audit rows are emitted for model and request activity."""
+
     reset_sequences = True
 
     def setUp(self):
+        """Create shared fixtures for the audit tests."""
         self.factory = RequestFactory()
         self.state = State.objects.create(name='Karnataka', state_code='29')
         self.organization = Organization.objects.create(name='Trace Org')
 
     def test_model_save_creates_audit_event(self):
+        """Saving a tracked model should emit an audit event."""
         Warehouse.objects.create(
             organization=self.organization,
             state=self.state,
@@ -31,6 +37,7 @@ class AuditTrailTests(TransactionTestCase):
         self.assertEqual(event.organization_id, self.organization.id)
 
     def test_request_middleware_links_request_and_model_events(self):
+        """One request should produce linked request and model audit rows."""
         middleware = AuditContextMiddleware(
             lambda request: self._create_org_response(request)
         )
@@ -47,5 +54,6 @@ class AuditTrailTests(TransactionTestCase):
         self.assertTrue(events.filter(event_type='account.organization.create').exists())
 
     def _create_org_response(self, request):
+        """Simulate a request handler that performs a tracked write."""
         Organization.objects.create(name='Request Trace Org')
         return HttpResponse(status=201)

@@ -1,3 +1,5 @@
+"""Audit event creation helpers and request logging utilities."""
+
 from decimal import Decimal
 from datetime import date, datetime
 from uuid import uuid4
@@ -15,6 +17,7 @@ SENSITIVE_PATH_MARKERS = ('/token', '/auth', '/login', '/logout', '/revoke', '/i
 
 
 def json_safe(value):
+    """Convert common Python and model values into JSON-safe primitives."""
     if value is None:
         return None
     if isinstance(value, (str, int, float, bool)):
@@ -33,6 +36,7 @@ def json_safe(value):
 
 
 def serialize_instance(instance):
+    """Serialize a model instance into a shallow JSON-friendly snapshot."""
     if instance is None:
         return {}
 
@@ -55,6 +59,7 @@ def serialize_instance(instance):
 
 
 def safe_object_repr(obj):
+    """Return a defensive string representation for audit storage."""
     if obj is None:
         return ''
     try:
@@ -66,6 +71,7 @@ def safe_object_repr(obj):
 
 
 def _resolve_related_value(instance, attrs):
+    """Follow a related-object attribute chain and return the terminal value."""
     value = instance
     for attr in attrs:
         if value is None:
@@ -75,6 +81,7 @@ def _resolve_related_value(instance, attrs):
 
 
 def resolve_organization(instance=None, request=None, explicit=None):
+    """Infer the organization from the request or related business object."""
     if explicit is not None:
         return explicit
 
@@ -117,6 +124,7 @@ def resolve_organization(instance=None, request=None, explicit=None):
 
 
 def resolve_actor(request=None):
+    """Return the authenticated Django user and linked application account."""
     if request is None:
         return None, None
     user = getattr(request, 'user', None)
@@ -127,6 +135,7 @@ def resolve_actor(request=None):
 
 
 def should_log_request(request, response=None, exception=None):
+    """Decide whether a request deserves a request-level audit event."""
     if exception is not None:
         return True
     method = getattr(request, 'method', '').upper()
@@ -162,6 +171,7 @@ def record_event(
     ip_address='',
     user_agent='',
 ):
+    """Persist one immutable audit event after the surrounding transaction commits."""
     request_context = get_request_context() or {}
     request = request or request_context.get('request')
     action = action or get_action_context() or ''
@@ -249,6 +259,7 @@ def record_event(
 
 
 def record_request_event(request, response=None, exception=None, started_at=None):
+    """Record the request-level audit row for a completed HTTP cycle."""
     if not should_log_request(request, response=response, exception=exception):
         return None
 

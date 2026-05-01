@@ -1,3 +1,5 @@
+"""Middleware that attaches audit context to each incoming request."""
+
 import time
 from uuid import uuid4
 
@@ -6,10 +8,14 @@ from .services import record_request_event
 
 
 class AuditContextMiddleware:
+    """Attach a correlation id and capture request-level audit metadata."""
+
     def __init__(self, get_response):
+        """Store the downstream response callable."""
         self.get_response = get_response
 
     def __call__(self, request):
+        """Wrap the request lifecycle with audit context state."""
         trace_id = uuid4().hex
         request.audit_trace_id = trace_id
         started_at = time.perf_counter()

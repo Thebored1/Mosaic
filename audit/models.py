@@ -1,3 +1,5 @@
+"""Persistent audit trail models."""
+
 from django.contrib.auth.models import User
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
@@ -5,6 +7,8 @@ from django.db import models
 
 
 class AuditEvent(models.Model):
+    """Immutable audit event row for one business or request action."""
+
     OUTCOME_CHOICES = [
         ('success', 'Success'),
         ('failure', 'Failure'),
@@ -60,6 +64,7 @@ class AuditEvent(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        """Keep the audit feed ordered and indexed for support queries."""
         ordering = ['-created_at', '-id']
         indexes = [
             models.Index(fields=['trace_id', 'created_at']),
@@ -71,10 +76,13 @@ class AuditEvent(models.Model):
         ]
 
     def __str__(self):
+        """Render a compact event label for admin and debugging."""
         return f'{self.event_type} - {self.object_repr or self.object_id}'
 
 
 class AuditEventLink(models.Model):
+    """Link an audit event to secondary entities it touched."""
+
     RELATION_CHOICES = [
         ('primary', 'Primary'),
         ('related', 'Related'),
@@ -91,6 +99,7 @@ class AuditEventLink(models.Model):
     metadata = models.JSONField(default=dict, blank=True)
 
     class Meta:
+        """Optimize entity lookups and keep link ordering stable."""
         ordering = ['id']
         indexes = [
             models.Index(fields=['content_type', 'object_id']),
@@ -98,4 +107,5 @@ class AuditEventLink(models.Model):
         ]
 
     def __str__(self):
+        """Render a compact link label for admin and debugging."""
         return f'{self.event_id} -> {self.object_repr or self.object_id}'

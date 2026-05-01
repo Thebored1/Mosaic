@@ -1,10 +1,15 @@
+"""Serializers for the audit event APIs."""
+
 from rest_framework import serializers
 
 from .models import AuditEvent, AuditEventLink
 
 
 class AuditEventLinkSerializer(serializers.ModelSerializer):
+    """Serialize linked entities for an audit event."""
+
     class Meta:
+        """Expose the minimal read-only link payload."""
         model = AuditEventLink
         fields = [
             'id',
@@ -17,6 +22,8 @@ class AuditEventLinkSerializer(serializers.ModelSerializer):
 
 
 class AuditEventSerializer(serializers.ModelSerializer):
+    """Serialize the immutable audit event record for read-only APIs."""
+
     links = AuditEventLinkSerializer(many=True, read_only=True)
     actor_username = serializers.CharField(source='actor_user.username', read_only=True)
     actor_account_role = serializers.CharField(source='actor_account.role', read_only=True)
@@ -24,6 +31,7 @@ class AuditEventSerializer(serializers.ModelSerializer):
     model_label = serializers.SerializerMethodField()
 
     class Meta:
+        """Return a complete read-only event payload."""
         model = AuditEvent
         fields = [
             'id',
@@ -60,7 +68,7 @@ class AuditEventSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_model_label(self, obj):
+        """Return the source model label for display and filtering."""
         if obj.content_type_id:
             return f'{obj.content_type.app_label}.{obj.content_type.model}'
         return ''
-

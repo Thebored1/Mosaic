@@ -1,3 +1,5 @@
+"""Read-only audit APIs for search, trace, and timeline inspection."""
+
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 from rest_framework import viewsets
@@ -13,6 +15,8 @@ from .serializers import AuditEventSerializer
 
 
 class AuditEventViewSet(viewsets.ReadOnlyModelViewSet):
+    """Expose searchable audit trails to admins and org users."""
+
     queryset = AuditEvent.objects.select_related(
         'organization',
         'actor_user',
@@ -29,6 +33,7 @@ class AuditEventViewSet(viewsets.ReadOnlyModelViewSet):
     ordering = ['-created_at']
 
     def get_queryset(self):
+        """Scope audit visibility by authentication context."""
         queryset = self.queryset
         if not hasattr(self.request, 'auth') or self.request.auth is None:
             return queryset.none()
@@ -41,6 +46,7 @@ class AuditEventViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=['get'])
     def timeline(self, request):
+        """Return the chronological audit timeline."""
         queryset = self.filter_queryset(self.get_queryset())
         page = self.paginate_queryset(queryset)
         serializer = self.get_serializer(page or queryset, many=True)
@@ -50,6 +56,7 @@ class AuditEventViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=['get'])
     def request_trace(self, request):
+        """Return all audit rows tied to one trace or correlation id."""
         trace_id = request.query_params.get('trace_id') or request.query_params.get('correlation_id')
         queryset = self.get_queryset()
         if trace_id:
@@ -58,6 +65,7 @@ class AuditEventViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=['get'])
     def entity_timeline(self, request):
+        """Return all audit rows for one entity."""
         content_type_id = request.query_params.get('content_type')
         app_label = request.query_params.get('app_label')
         model = request.query_params.get('model')
@@ -76,6 +84,7 @@ class AuditEventViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=['get'])
     def user_activity(self, request):
+        """Return audit rows for one actor user or application account."""
         user_id = request.query_params.get('user')
         account_id = request.query_params.get('account')
         queryset = self.get_queryset()
@@ -84,4 +93,3 @@ class AuditEventViewSet(viewsets.ReadOnlyModelViewSet):
         if account_id:
             queryset = queryset.filter(actor_account_id=account_id)
         return Response(self.get_serializer(self.filter_queryset(queryset), many=True).data)
-

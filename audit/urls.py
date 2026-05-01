@@ -1,3 +1,5 @@
+"""URL routes for audit inspection endpoints."""
+
 from rest_framework.routers import DefaultRouter
 
 from .views import AuditEventViewSet
