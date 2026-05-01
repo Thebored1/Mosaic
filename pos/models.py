@@ -157,6 +157,9 @@ class Shift(models.Model):
             'closing_cash', 'expected_cash', 'variance',
             'status', 'closing_time'
         ])
+
+        from accounting.services import post_shift_close
+        post_shift_close(self)
         
         return {
             'shift_number': self.shift_number,
@@ -264,7 +267,11 @@ class CashTransaction(models.Model):
             raise ValidationError({'shift': 'Cannot add transaction to closed shift'})
 
     def save(self, *args, **kwargs):
+        created = self.pk is None
         self.full_clean()
         if not self.created_by:
             self.created_by = self.shift.user
         super().save(*args, **kwargs)
+        if created:
+            from accounting.services import post_cash_transaction
+            post_cash_transaction(self.shift, self)

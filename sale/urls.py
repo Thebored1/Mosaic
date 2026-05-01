@@ -18,6 +18,7 @@ from .views import (
     StateViewSet, BusinessLocationViewSet, PartyViewSet,
     # Orders
     OrderViewSet,
+    DeliveryChallanViewSet,
     # Sales
     InvoiceViewSet, ReceiptViewSet, CreditNoteViewSet,
     # Purchase
@@ -66,6 +67,14 @@ router.register(r'parties', PartyViewSet, basename='parties')
 # POST /sale/orders/{id}/convert/ - Convert to invoice
 # Filtering: /sale/orders/?status=Hold&business_location=1
 router.register(r'orders', OrderViewSet, basename='orders')
+
+# ===================== CHALLAN ENDPOINTS =====================
+
+# Delivery Challans
+# GET /sale/challans/ - List challans
+# POST /sale/challans/ - Create challan
+# POST /sale/challans/combine/ - Combine multiple challans into one invoice
+router.register(r'challans', DeliveryChallanViewSet, basename='challans')
 
 # ===================== SALES ENDPOINTS =====================
 

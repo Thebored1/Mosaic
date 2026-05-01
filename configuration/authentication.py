@@ -48,6 +48,15 @@ ACTION_ALIASES = {
     'daily_sales': 'read',
     'gst_register': 'read',
     'gstr1': 'read',
+    'trial_balance': 'read',
+    'general_ledger': 'read',
+    'balance_sheet': 'read',
+    'profit_loss': 'read',
+    'aging': 'read',
+    'party_statement': 'read',
+    'invoice_profit': 'read',
+    'expense_report': 'read',
+    'combine': 'write',
     'create': 'write',
     'update': 'write',
     'partial_update': 'write',
@@ -116,6 +125,16 @@ ROLE_POLICIES = {
     },
     'reporting': {
         'read': {'Owner', 'Admin', 'Manager', 'Sales', 'Warehouse'},
+    },
+    'accounting': {
+        'read': MANAGEMENT_ROLES,
+        'write': ADMIN_ROLES,
+        'delete': ADMIN_ROLES,
+    },
+    'expense_tracking': {
+        'read': MANAGEMENT_ROLES,
+        'write': MANAGEMENT_ROLES,
+        'delete': ADMIN_ROLES,
     },
     'pos_operations': {
         'read': POS_ROLES,

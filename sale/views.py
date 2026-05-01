@@ -24,6 +24,7 @@ from configuration.authentication import SUPER_ADMIN_MARKER, ECOMMERCE_MARKER, S
 from .models import (
     Party,
     Order, OrderItem,
+    DeliveryChallan, DeliveryChallanItem,
     Invoice, InvoiceItem,
     CreditNote, Receipt,
     PurchaseOrder, PurchaseOrderItem,
@@ -32,9 +33,11 @@ from .models import (
     DebitNote, PaymentOut,
     PriceList, Quotation
 )
+from .services import post_good_receipt_note
 from .serializers import (
     StateSerializer, BusinessLocationSerializer, PartySerializer,
     OrderSerializer, OrderCreateSerializer,
+    DeliveryChallanListSerializer, DeliveryChallanDetailSerializer, DeliveryChallanCreateSerializer,
     InvoiceListSerializer, InvoiceDetailSerializer, InvoiceCreateSerializer,
     InvoiceItemSerializer,
     PriceListListSerializer, PriceListDetailSerializer, PriceListCreateSerializer,
@@ -414,6 +417,7 @@ class OrderViewSet(viewsets.ModelViewSet):
                 'party': order.party,
                 'business_location': order.business_location,
                 'due_date': request.data.get('due_date'),
+                'tcs_rate': request.data.get('tcs_rate', 0),
                 'notes': request.data.get('notes', ''),
                 'order': order
             }
@@ -457,6 +461,123 @@ class OrderViewSet(viewsets.ModelViewSet):
             'invoice_number': invoice.invoice_number,
             'message': 'Order converted to invoice. Finalize to complete.'
         })
+
+
+# ===================== CHALLAN VIEWSETS =====================
+
+class DeliveryChallanViewSet(viewsets.ModelViewSet):
+    """CRUD viewset for delivery challans that can be consolidated into invoices."""
+
+    queryset = DeliveryChallan.objects.all()
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'sales_operations'
+    pagination_class = StandardPagination
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ['party', 'business_location', 'status']
+    search_fields = ['challan_number', 'party__name']
+    ordering_fields = ['challan_date', 'challan_number']
+    ordering = ['-challan_date', '-id']
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
+
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return DeliveryChallanListSerializer
+        if self.action in ['create', 'update', 'partial_update']:
+            return DeliveryChallanCreateSerializer
+        return DeliveryChallanDetailSerializer
+
+    def _ensure_editable(self, challan):
+        """Block edits once a challan has been invoiced or cancelled."""
+        if challan.status in {'Invoiced', 'Cancelled'}:
+            raise ValidationError({'challan': 'Invoiced or cancelled challans cannot be edited.'})
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validate_related_organization(
+            request,
+            party=serializer.validated_data.get('party'),
+            business_location=serializer.validated_data.get('business_location'),
+        )
+        challan = save_for_request_organization(serializer, request)
+        return Response(DeliveryChallanDetailSerializer(challan).data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        raise ValidationError({'challan': 'Delivery challans are immutable after creation.'})
+
+    def partial_update(self, request, *args, **kwargs):
+        raise ValidationError({'challan': 'Delivery challans are immutable after creation.'})
+
+    def destroy(self, request, *args, **kwargs):
+        challan = self.get_object()
+        self._ensure_editable(challan)
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=False, methods=['post'])
+    @transaction.atomic
+    def combine(self, request):
+        """Combine multiple challans into a single invoice."""
+        challan_ids = request.data.get('challans', [])
+        if not challan_ids:
+            raise ValidationError({'challans': 'At least one challan is required.'})
+        if len(set(str(cid) for cid in challan_ids)) != len(challan_ids):
+            raise ValidationError({'challans': 'Duplicate challan ids are not allowed.'})
+
+        challans = list(self.get_queryset().filter(id__in=challan_ids).prefetch_related('items'))
+        if len(challans) != len(set(int(cid) for cid in challan_ids)):
+            raise ValidationError({'challans': 'One or more challans were not found.'})
+        if any(ch.status == 'Invoiced' for ch in challans):
+            raise ValidationError({'challans': 'Already invoiced challans cannot be combined again.'})
+
+        party = challans[0].party
+        business_location = challans[0].business_location
+        if any(ch.party_id != party.id for ch in challans):
+            raise ValidationError({'challans': 'All challans must belong to the same party.'})
+        if any(ch.business_location_id != business_location.id for ch in challans):
+            raise ValidationError({'challans': 'All challans must belong to the same business location.'})
+        if party is None:
+            raise ValidationError({'challans': 'A party is required to combine challans.'})
+        if business_location is None:
+            raise ValidationError({'challans': 'A business location is required to combine challans.'})
+
+        billing_state = party.state or business_location.state
+        if billing_state is None:
+            raise ValidationError({'billing_state': 'A billing state is required to combine challans into an invoice.'})
+
+        invoice = Invoice.objects.create(
+            invoice_type=request.data.get('invoice_type', 'Tax Invoice'),
+            party=party,
+            business_location=business_location,
+            billing_state=billing_state,
+            due_date=request.data.get('due_date'),
+            notes=request.data.get('notes', ''),
+            terms=request.data.get('terms', ''),
+            tcs_rate=request.data.get('tcs_rate', 0),
+            created_by=request.user,
+        )
+
+        for challan in challans:
+            for challan_item in challan.items.all():
+                InvoiceItem.objects.create(
+                    invoice=invoice,
+                    item=challan_item.item,
+                    item_variant=challan_item.item_variant,
+                    source_challan=challan,
+                    hsn_code=challan_item.hsn_code,
+                    quantity=challan_item.quantity,
+                    unit=challan_item.unit,
+                    rate=challan_item.rate,
+                    discount=challan_item.discount,
+                )
+            challan.status = 'Invoiced'
+            challan.save(update_fields=['status'])
+
+        invoice.source_challans.set(challans)
+        invoice.calculate_totals()
+        return Response(InvoiceDetailSerializer(invoice).data, status=status.HTTP_201_CREATED)
 
 
 # ===================== INVOICE VIEWSETS =====================
@@ -689,7 +810,6 @@ class ReceiptViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         validate_related_organization(
             self.request,
-            invoice=serializer.validated_data.get('invoice'),
             party=serializer.validated_data.get('party'),
             business_location=serializer.validated_data.get('business_location'),
         )
@@ -777,37 +897,55 @@ class GoodReceiptNoteViewSet(viewsets.ModelViewSet):
         )
         serializer.save()
 
+    def update(self, request, *args, **kwargs):
+        grn = self.get_object()
+        if grn.status != 'Draft':
+            raise ValidationError({'grn': 'Posted GRNs cannot be edited.'})
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        grn = self.get_object()
+        if grn.status != 'Draft':
+            raise ValidationError({'grn': 'Posted GRNs cannot be deleted.'})
+        return super().destroy(request, *args, **kwargs)
+
     @action(detail=True, methods=['post'])
     def create_invoice(self, request, pk=None):
         """Create purchase invoice from GRN."""
         grn = self.get_object()
+        if grn.purchase_invoices.exists():
+            return Response({'error': 'GRN already has a purchase invoice.'}, status=400)
 
-        # Create purchase invoice from GRN
-        pi = PurchaseInvoice.objects.create(
-            supplier=grn.supplier,
-            business_location=grn.business_location,
-            grn=grn,
-            purchase_order=grn.purchase_order,
-            supplier_invoice_number=request.data.get('supplier_invoice_number', grn.supplier_invoice_number),
-            supplier_invoice_date=request.data.get('supplier_invoice_date', grn.supplier_invoice_date),
-            created_by=request.user
-        )
+        with transaction.atomic():
+            post_good_receipt_note(grn, user=request.user)
 
-        # Copy items from GRN
-        for grn_item in grn.grn_items.all():
-            taxable = (grn_item.quantity * grn_item.rate)
-
-            PurchaseInvoiceItem.objects.create(
-                purchase_invoice=pi,
-                item=grn_item.item,
-                item_variant=grn_item.item_variant,
-                quantity=grn_item.quantity,
-                unit=grn_item.unit,
-                rate=grn_item.rate,
-                taxable_amount=taxable
+            # Create purchase invoice from GRN
+            pi = PurchaseInvoice.objects.create(
+                supplier=grn.supplier,
+                business_location=grn.business_location,
+                grn=grn,
+                purchase_order=grn.purchase_order,
+                supplier_invoice_number=request.data.get('supplier_invoice_number', grn.supplier_invoice_number),
+                supplier_invoice_date=request.data.get('supplier_invoice_date', grn.supplier_invoice_date),
+                created_by=request.user
             )
 
-        pi.save()
+            # Copy items from GRN
+            for grn_item in grn.grn_items.all():
+                taxable = (grn_item.quantity * grn_item.rate)
+
+                PurchaseInvoiceItem.objects.create(
+                    purchase_invoice=pi,
+                    item=grn_item.item,
+                    item_variant=grn_item.item_variant,
+                    quantity=grn_item.quantity,
+                    unit=grn_item.unit,
+                    rate=grn_item.rate,
+                    taxable_amount=taxable
+                )
+
+            pi.calculate_totals()
+            pi.save()
 
         return Response({
             'purchase_invoice_id': pi.id,
@@ -867,8 +1005,10 @@ class PurchaseInvoiceViewSet(viewsets.ModelViewSet):
         if pi.status != 'Finalized':
             return Response({'error': 'Only finalized can be cancelled'}, status=400)
 
-        pi.status = 'Cancelled'
-        pi.save()
+        try:
+            pi.cancel(user=request.user)
+        except Exception as e:
+            return Response({'error': str(e)}, status=400)
         return Response({'message': 'Purchase invoice cancelled'})
 
 

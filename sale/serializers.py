@@ -20,6 +20,7 @@ from configuration.authentication import SUPER_ADMIN_MARKER
 from .models import (
     Party,
     Order, OrderItem,
+    DeliveryChallan, DeliveryChallanItem,
     Invoice, InvoiceItem,
     CreditNote, Receipt,
     PurchaseOrder, PurchaseOrderItem,
@@ -379,6 +380,69 @@ class OrderItemSerializer(serializers.ModelSerializer):
         ]
 
 
+class DeliveryChallanItemSerializer(serializers.ModelSerializer):
+    """Serialize line items inside a delivery challan."""
+    item_name = serializers.CharField(source='item.name', read_only=True)
+    item_sku = serializers.CharField(source='item.sku', read_only=True)
+
+    class Meta:
+        model = DeliveryChallanItem
+        fields = ['id', 'item', 'item_name', 'item_sku', 'item_variant', 'hsn_code', 'quantity', 'unit', 'rate', 'discount', 'total']
+
+
+class DeliveryChallanListSerializer(serializers.ModelSerializer):
+    """Serialize delivery challans for list views."""
+    party_name = serializers.CharField(source='party.name', read_only=True)
+
+    class Meta:
+        model = DeliveryChallan
+        fields = ['id', 'challan_number', 'party', 'party_name', 'business_location', 'challan_date', 'status']
+
+
+class DeliveryChallanDetailSerializer(serializers.ModelSerializer):
+    """Serialize a full delivery challan with nested line items."""
+    items = DeliveryChallanItemSerializer(many=True, read_only=True)
+    party = PartySerializer(read_only=True)
+    business_location = BusinessLocationSerializer(read_only=True)
+
+    class Meta:
+        model = DeliveryChallan
+        fields = ['id', 'challan_number', 'party', 'business_location', 'challan_date', 'status', 'items', 'notes', 'created_at', 'created_by']
+
+
+class DeliveryChallanCreateSerializer(serializers.ModelSerializer):
+    """Create a delivery challan with nested line items."""
+    items = serializers.ListField(child=serializers.DictField(), write_only=True)
+
+    class Meta:
+        model = DeliveryChallan
+        fields = ['party', 'business_location', 'challan_date', 'notes', 'items']
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items', [])
+        request = self.context.get('request')
+        challan = DeliveryChallan.objects.create(
+            created_by=request.user if request else None,
+            **validated_data
+        )
+        from stock.models import Item, ItemVariant
+        for item_data in items_data:
+            item = Item.objects.get(pk=item_data['item'])
+            variant_id = item_data.get('item_variant')
+            variant = ItemVariant.objects.get(pk=variant_id) if variant_id else None
+            DeliveryChallanItem.objects.create(
+                delivery_challan=challan,
+                item=item,
+                item_variant=variant,
+                hsn_code=item.tax_code.code if item.tax_code else '',
+                quantity=item_data.get('quantity', 1),
+                unit=item.unit,
+                rate=item_data.get('rate', item.unit_price),
+                discount=item_data.get('discount', 0),
+            )
+        return challan
+
+
 class OrderSerializer(serializers.ModelSerializer):
     """
     Serialize POS orders while they are still part of the billing flow.
@@ -486,9 +550,10 @@ class InvoiceItemSerializer(serializers.ModelSerializer):
         model = InvoiceItem
         fields = [
             'id', 'item', 'item_name', 'item_sku',
-            'item_variant', 'batch', 'hsn_code',
+            'item_variant', 'batch', 'source_challan', 'hsn_code',
             'quantity', 'unit', 'unit_name',
             'rate', 'discount', 'taxable_amount',
+            'cost_price_snapshot', 'cost_basis', 'gross_profit',
             'cgst_rate', 'cgst_amount',
             'sgst_rate', 'sgst_amount',
             'igst_rate', 'igst_amount',
@@ -514,7 +579,7 @@ class InvoiceListSerializer(serializers.ModelSerializer):
             'party', 'party_name', 'billing_state_name',
             'business_location', 'business_location_name',
             'sub_total', 'cgst_amount', 'sgst_amount', 'igst_amount',
-            'grand_total', 'status'
+            'tcs_rate', 'tcs_amount', 'gross_profit_amount', 'grand_total', 'status'
         ]
 
 
@@ -536,8 +601,9 @@ class InvoiceDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'invoice_number', 'invoice_type', 'invoice_date', 'due_date',
             'party', 'billing_state', 'business_location',
+            'source_challans',
             'items', 'sub_total', 'discount_amount', 'discount_type',
-            'taxable_amount', 'cgst_amount', 'sgst_amount', 'igst_amount',
+            'taxable_amount', 'tcs_rate', 'tcs_amount', 'gross_profit_amount', 'cgst_amount', 'sgst_amount', 'igst_amount',
             'round_off', 'grand_total', 'tax_summary',
             'notes', 'terms', 'status',
             'e_way_bill', 'order', 'created_at', 'created_by', 'created_by_name'
@@ -562,7 +628,7 @@ class InvoiceCreateSerializer(serializers.ModelSerializer):
         model = Invoice
         fields = [
             'invoice_type', 'party', 'business_location', 'billing_state',
-            'due_date', 'items', 'discount_amount', 'discount_type',
+            'due_date', 'items', 'discount_amount', 'discount_type', 'tcs_rate',
             'notes', 'terms'
         ]
 
@@ -579,6 +645,7 @@ class InvoiceCreateSerializer(serializers.ModelSerializer):
             due_date=validated_data.get('due_date'),
             discount_amount=validated_data.get('discount_amount', 0),
             discount_type=validated_data.get('discount_type', 'Fixed'),
+            tcs_rate=validated_data.get('tcs_rate', 0),
             notes=validated_data.get('notes', ''),
             terms=validated_data.get('terms', ''),
             created_by=request.user if request else None
@@ -632,14 +699,13 @@ class ReceiptSerializer(serializers.ModelSerializer):
     Receipts are the payment-side counterpart to invoices and are used for
     partial payments, advances, and settlement tracking.
     """
-    invoice = InvoiceListSerializer(read_only=True)
     party = PartySerializer(read_only=True)
     received_by_name = serializers.CharField(source='received_by.username', read_only=True)
 
     class Meta:
         model = Receipt
         fields = [
-            'id', 'receipt_number', 'invoice', 'party',
+            'id', 'receipt_number', 'party',
             'business_location', 'amount', 'payment_mode',
             'reference_number', 'transaction_date', 'notes',
             'created_at', 'received_by', 'received_by_name'
@@ -649,7 +715,7 @@ class ReceiptSerializer(serializers.ModelSerializer):
 class ReceiptCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Receipt
-        fields = ['invoice', 'party', 'business_location', 'amount', 'payment_mode', 'reference_number', 'notes']
+        fields = ['party', 'business_location', 'amount', 'payment_mode', 'reference_number', 'notes']
 
 
 class CreditNoteSerializer(serializers.ModelSerializer):
@@ -707,10 +773,11 @@ class PurchaseOrderDetailSerializer(serializers.ModelSerializer):
 class GRNItemSerializer(serializers.ModelSerializer):
     """Serialize items inside a goods receipt note."""
     item_name = serializers.CharField(source='item.name', read_only=True)
+    batch_number = serializers.CharField(source='batch.batch_number', read_only=True)
 
     class Meta:
         model = GRNItem
-        fields = ['id', 'item', 'item_name', 'item_variant', 'quantity', 'unit', 'rate', 'total']
+        fields = ['id', 'item', 'item_name', 'item_variant', 'quantity', 'unit', 'rate', 'batch', 'batch_number', 'total']
 
 
 class GRNListSerializer(serializers.ModelSerializer):
@@ -719,7 +786,7 @@ class GRNListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = GoodReceiptNote
-        fields = ['id', 'grn_number', 'supplier', 'supplier_name', 'received_date', 'supplier_invoice_number']
+        fields = ['id', 'grn_number', 'supplier', 'supplier_name', 'received_date', 'supplier_invoice_number', 'status']
 
 
 class GRNDetailSerializer(serializers.ModelSerializer):
@@ -730,7 +797,8 @@ class GRNDetailSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = GoodReceiptNote
-        fields = ['id', 'grn_number', 'purchase_order', 'supplier', 'business_location', 'received_date', 'supplier_invoice_number', 'supplier_invoice_date', 'grn_items', 'notes', 'created_at']
+        fields = ['id', 'grn_number', 'purchase_order', 'supplier', 'business_location', 'received_date', 'supplier_invoice_number', 'supplier_invoice_date', 'status', 'posted_at', 'grn_items', 'notes', 'created_at']
+        read_only_fields = ['id', 'grn_number', 'status', 'posted_at', 'created_at']
 
 
 class PurchaseInvoiceItemSerializer(serializers.ModelSerializer):
@@ -775,9 +843,8 @@ class DebitNoteSerializer(serializers.ModelSerializer):
 
 class PaymentOutSerializer(serializers.ModelSerializer):
     """Serialize payments made to suppliers."""
-    purchase_invoice = PurchaseInvoiceListSerializer(read_only=True)
     supplier = PartySerializer(read_only=True)
 
     class Meta:
         model = PaymentOut
-        fields = ['id', 'payment_number', 'purchase_invoice', 'supplier', 'business_location', 'amount', 'payment_mode', 'reference_number', 'transaction_date', 'notes', 'created_at']
+        fields = ['id', 'payment_number', 'supplier', 'business_location', 'amount', 'payment_mode', 'reference_number', 'transaction_date', 'notes', 'created_at']

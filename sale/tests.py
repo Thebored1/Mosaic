@@ -6,8 +6,11 @@ from rest_framework.test import APITestCase
 
 from account.models import Organization, UserAccount
 from configuration.models import ApiToken, State, SuperAdminToken, Warehouse
-from sale.models import Party, Order, OrderItem, Invoice, PriceList, PriceListItem, Quotation
-from stock.models import Category, Item, StockMovement
+from sale.models import (
+    Party, Order, OrderItem, Invoice, PriceList, PriceListItem, Quotation,
+    PurchaseOrder, PurchaseOrderItem, GoodReceiptNote, GRNItem, PurchaseInvoice,
+)
+from stock.models import Category, Item, ItemVariant, Batch, StockMovement
 
 
 class SaleAuthTests(APITestCase):
@@ -272,3 +275,92 @@ class SaleAuthTests(APITestCase):
         self.assertEqual(StockMovement.objects.filter(source_document_type='sale.InvoiceItem').count(), 1)
         quotation = Quotation.objects.get(id=quotation_response.data['id'])
         self.assertEqual(quotation.status, 'Converted')
+
+    def test_grn_invoice_updates_po_receiving_and_batch(self):
+        supplier = Party.objects.create(
+            organization=self.organization,
+            name='Supplier One',
+            party_type='Supplier',
+        )
+        grn_category = Category.objects.create(name='GRN Category', organization=self.organization)
+        grn_item_master = Item.objects.create(
+            organization=self.organization,
+            name='GRN Item',
+            sku='GRN-001',
+            category=grn_category,
+            unit_price=Decimal('50.00'),
+            cost_price=Decimal('40.00'),
+        )
+        variant = ItemVariant.objects.create(
+            organization=self.organization,
+            item=grn_item_master,
+            sku='GRN-001-V1',
+            unit_price=Decimal('50.00'),
+            cost_price=Decimal('40.00'),
+        )
+        po = PurchaseOrder.objects.create(
+            supplier=supplier,
+            business_location=self.warehouse,
+            status='Sent',
+            created_by=self.sales_user,
+        )
+        po_item = PurchaseOrderItem.objects.create(
+            purchase_order=po,
+            item=grn_item_master,
+            item_variant=variant,
+            quantity_ordered=Decimal('5.0000'),
+            unit=None,
+            rate=Decimal('50.00'),
+            discount=Decimal('0.00'),
+        )
+        grn = GoodReceiptNote.objects.create(
+            purchase_order=po,
+            supplier=supplier,
+            business_location=self.warehouse,
+            created_by=self.sales_user,
+            supplier_invoice_number='SUP-001',
+        )
+        grn_line = GRNItem.objects.create(
+            grn=grn,
+            item=grn_item_master,
+            item_variant=variant,
+            quantity=Decimal('3.0000'),
+            unit=None,
+            rate=Decimal('50.00'),
+        )
+
+        response = self.client.post(
+            f'/v1/sale/grns/{grn.id}/create_invoice/?organization={self.organization.id}',
+            {
+                'supplier_invoice_number': 'SUP-001',
+                'supplier_invoice_date': '2026-05-01',
+            },
+            format='json',
+            HTTP_AUTHORIZATION=f'Bearer {self.super_token}',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        po_item.refresh_from_db()
+        po.refresh_from_db()
+        grn.refresh_from_db()
+        grn_line.refresh_from_db()
+        variant.refresh_from_db()
+
+        self.assertEqual(po_item.quantity_received, Decimal('3.0000'))
+        self.assertEqual(po.status, 'Partial')
+        self.assertEqual(grn.status, 'Posted')
+        self.assertIsNotNone(grn_line.batch_id)
+        self.assertEqual(grn_line.batch.quantity_received, Decimal('3.0000'))
+        self.assertEqual(grn_line.batch.quantity_remaining, Decimal('3.0000'))
+        self.assertEqual(variant.current_stock, Decimal('3.0000'))
+
+        purchase_invoice = PurchaseInvoice.objects.get(pk=response.data['purchase_invoice_id'])
+        finalize_response = self.client.post(
+            f'/v1/sale/purchase-invoices/{purchase_invoice.id}/finalize/?organization={self.organization.id}',
+            format='json',
+            HTTP_AUTHORIZATION=f'Bearer {self.super_token}',
+        )
+
+        self.assertEqual(finalize_response.status_code, status.HTTP_200_OK)
+        variant.refresh_from_db()
+        self.assertEqual(variant.current_stock, Decimal('3.0000'))

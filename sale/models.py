@@ -727,6 +727,116 @@ class OrderItem(models.Model):
         self.order.calculate_totals()
 
 
+class DeliveryChallan(models.Model):
+    """
+    Delivery challan used to dispatch goods before final sale invoicing.
+
+    Multiple challans can later be consolidated into one invoice while keeping
+    traceability to each source document and its lines.
+    """
+    STATUS_CHOICES = [
+        ('Draft', 'Draft'),
+        ('Dispatched', 'Dispatched'),
+        ('Invoiced', 'Invoiced'),
+        ('Cancelled', 'Cancelled'),
+    ]
+
+    organization = models.ForeignKey(
+        'account.Organization',
+        on_delete=models.CASCADE,
+        related_name='delivery_challans'
+    )
+    challan_number = models.CharField(max_length=20, unique=True)
+    party = models.ForeignKey(
+        Party,
+        on_delete=models.PROTECT,
+        related_name='delivery_challans'
+    )
+    business_location = models.ForeignKey(
+        'configuration.Warehouse',
+        on_delete=models.PROTECT,
+        related_name='delivery_challans'
+    )
+    challan_date = models.DateField(default=timezone.now)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Draft')
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='delivery_challans_created'
+    )
+
+    class Meta:
+        verbose_name = 'Delivery Challan'
+        verbose_name_plural = 'Delivery Challans'
+        ordering = ['-challan_date', '-id']
+
+    def __str__(self):
+        return f"{self.challan_number} - {self.party.name}"
+
+    def save(self, *args, **kwargs):
+        if not self.challan_number:
+            prefix = f"CH{timezone.now().strftime('%Y%m%d')}"
+            last = DeliveryChallan.objects.filter(challan_number__startswith=prefix).order_by('-challan_number').first()
+            if last:
+                try:
+                    num = int(last.challan_number[-4:])
+                    self.challan_number = f"{prefix}{num + 1:04d}"
+                except ValueError:
+                    self.challan_number = f"{prefix}0001"
+            else:
+                self.challan_number = f"{prefix}0001"
+        super().save(*args, **kwargs)
+
+
+class DeliveryChallanItem(models.Model):
+    """
+    Individual line item inside a delivery challan.
+
+    The item structure mirrors order and invoice line items so challans can be
+    copied into a final sale invoice without losing pricing or traceability.
+    """
+    delivery_challan = models.ForeignKey(
+        DeliveryChallan,
+        on_delete=models.CASCADE,
+        related_name='items'
+    )
+    item = models.ForeignKey(
+        'stock.Item',
+        on_delete=models.PROTECT,
+        related_name='delivery_challan_items'
+    )
+    item_variant = models.ForeignKey(
+        'stock.ItemVariant',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='delivery_challan_items'
+    )
+    hsn_code = models.CharField(max_length=10, blank=True)
+    quantity = models.DecimalField(max_digits=12, decimal_places=4)
+    unit = models.ForeignKey(
+        'stock.Unit',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='delivery_challan_items'
+    )
+    rate = models.DecimalField(max_digits=12, decimal_places=2)
+    discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+
+    class Meta:
+        verbose_name = 'Delivery Challan Item'
+        verbose_name_plural = 'Delivery Challan Items'
+
+    def save(self, *args, **kwargs):
+        self.total = (self.quantity * self.rate) - self.discount
+        super().save(*args, **kwargs)
+
+
 class Invoice(models.Model):
     """
     Invoice - Sales Tax Invoice / Bill of Supply
@@ -864,6 +974,11 @@ class Invoice(models.Model):
         on_delete=models.PROTECT,
         related_name='invoices'
     )
+    source_challans = models.ManyToManyField(
+        DeliveryChallan,
+        blank=True,
+        related_name='invoices'
+    )
     invoice_date = models.DateTimeField(default=timezone.now)
     due_date = models.DateField(
         null=True,
@@ -880,6 +995,9 @@ class Invoice(models.Model):
         default='Fixed'
     )
     taxable_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    tcs_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    tcs_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    gross_profit_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
 
     cgst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
     sgst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
@@ -969,6 +1087,8 @@ class Invoice(models.Model):
         sgst_amount = quantize_money(sum((item.sgst_amount for item in items), Decimal('0')))
         igst_amount = quantize_money(sum((item.igst_amount for item in items), Decimal('0')))
         cess_amount = quantize_money(sum((item.cess_amount for item in items), Decimal('0')))
+        tcs_amount = quantize_money((taxable_amount * self.tcs_rate) / 100)
+        cost_basis = quantize_money(sum((item.cost_basis for item in items), Decimal('0')))
 
         summary = {}
         for item in items:
@@ -990,8 +1110,10 @@ class Invoice(models.Model):
         self.cgst_amount = cgst_amount
         self.sgst_amount = sgst_amount
         self.igst_amount = igst_amount
+        self.tcs_amount = tcs_amount
         self.round_off = quantize_money(self.round_off or Decimal('0'))
-        self.grand_total = quantize_money(taxable_amount + cgst_amount + sgst_amount + igst_amount + cess_amount + self.round_off)
+        self.gross_profit_amount = quantize_money(taxable_amount - cost_basis)
+        self.grand_total = quantize_money(taxable_amount + cgst_amount + sgst_amount + igst_amount + cess_amount + tcs_amount + self.round_off)
         self.tax_summary = {
             rate: {key: str(quantize_money(value)) for key, value in values.items()}
             for rate, values in summary.items()
@@ -1000,6 +1122,8 @@ class Invoice(models.Model):
             'sub_total',
             'discount_amount',
             'taxable_amount',
+            'tcs_amount',
+            'gross_profit_amount',
             'cgst_amount',
             'sgst_amount',
             'igst_amount',
@@ -1027,6 +1151,7 @@ class Invoice(models.Model):
             if self.status != 'Draft':
                 raise ValidationError(f"Cannot finalize invoice with status '{self.status}'")
 
+            self.calculate_totals()
             if not self.invoice_number:
                 self.invoice_number = self.business_location.get_next_invoice_number()
 
@@ -1063,6 +1188,9 @@ class Invoice(models.Model):
             if self.order:
                 self.order.status = 'Invoiced'
                 self.order.save(update_fields=['status'])
+
+            from accounting.services import post_sale_invoice
+            post_sale_invoice(self)
 
     def cancel(self, user):
         """
@@ -1116,6 +1244,9 @@ class Invoice(models.Model):
                         source_line_reference=item.pk,
                         notes='Invoice cancellation',
                     )
+
+            from accounting.services import post_invoice_cancellation
+            post_invoice_cancellation(self, user=user)
 
 
 class InvoiceItem(models.Model):
@@ -1199,6 +1330,13 @@ class InvoiceItem(models.Model):
         blank=True,
         related_name='invoice_items'
     )
+    source_challan = models.ForeignKey(
+        DeliveryChallan,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='invoice_items'
+    )
 
     hsn_code = models.CharField(max_length=10, blank=True)
     quantity = models.DecimalField(max_digits=12, decimal_places=4)
@@ -1214,6 +1352,9 @@ class InvoiceItem(models.Model):
     discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'), blank=True)
 
     taxable_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    cost_price_snapshot = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    cost_basis = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
+    gross_profit = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
 
     cgst_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
     cgst_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0'))
@@ -1236,31 +1377,36 @@ class InvoiceItem(models.Model):
 
     def calculate_totals(self):
         """Calculate tax amounts based on state comparison."""
+        if self.item_variant_id:
+            self.cost_price_snapshot = self.item_variant.cost_price
+        else:
+            self.cost_price_snapshot = self.item.cost_price
+        self.cost_basis = (self.quantity * self.cost_price_snapshot)
         self.taxable_amount = (self.quantity * self.rate) - self.discount
+        self.cgst_rate = Decimal('0')
+        self.cgst_amount = Decimal('0')
+        self.sgst_rate = Decimal('0')
+        self.sgst_amount = Decimal('0')
+        self.igst_rate = Decimal('0')
+        self.igst_amount = Decimal('0')
         # Check if intra-state or inter-state
         if self.invoice.billing_state_id == self.invoice.business_location.state_id:
             # Intra-state: CGST + SGST
             if self.item.tax_code:
-                tax_rate = self.item.cgst_rate + self.item.sgst_rate
                 self.cgst_rate = self.item.cgst_rate
                 self.sgst_rate = self.item.sgst_rate
-                self.igst_rate = Decimal('0')
 
                 self.cgst_amount = self.taxable_amount * self.cgst_rate / 100
                 self.sgst_amount = self.taxable_amount * self.sgst_rate / 100
-                self.igst_amount = Decimal('0')
         else:
             # Inter-state: IGST
-            self.igst_rate = self.item.igst_rate
-            self.cgst_rate = Decimal('0')
-            self.sgst_rate = Decimal('0')
-
-            self.igst_amount = self.taxable_amount * self.igst_rate / 100
-            self.cgst_amount = Decimal('0')
-            self.sgst_amount = Decimal('0')
+            if self.item.tax_code:
+                self.igst_rate = self.item.igst_rate
+                self.igst_amount = self.taxable_amount * self.igst_rate / 100
 
         self.cess_amount = self.taxable_amount * self.cess_rate / 100
         self.total = self.taxable_amount + self.cgst_amount + self.sgst_amount + self.igst_amount + self.cess_amount
+        self.gross_profit = self.taxable_amount - self.cost_basis
 
 
     def save(self, *args, **kwargs):
@@ -1328,9 +1474,13 @@ class CreditNote(models.Model):
         ordering = ['-created_at']
 
     def save(self, *args, **kwargs):
+        created = self.pk is None
         if not self.credit_note_number:
             self.credit_note_number = self.generate_credit_note_number()
         super().save(*args, **kwargs)
+        if created and self.amount:
+            from accounting.services import post_credit_note
+            post_credit_note(self)
 
     def generate_credit_note_number(self):
         prefix = f"CN{timezone.now().strftime('%Y%m%d')}"
@@ -1543,9 +1693,13 @@ class Receipt(models.Model):
         ordering = ['-transaction_date']
 
     def save(self, *args, **kwargs):
+        created = self.pk is None
         if not self.receipt_number:
             self.receipt_number = self.generate_receipt_number()
         super().save(*args, **kwargs)
+        if created and self.amount:
+            from accounting.services import post_receipt
+            post_receipt(self)
 
     def generate_receipt_number(self):
         prefix = f"RCPT{timezone.now().strftime('%Y%m%d')}"
@@ -1642,6 +1796,24 @@ class PurchaseOrder(models.Model):
             self.po_number = self.generate_po_number()
         super().save(*args, **kwargs)
 
+    def recalculate_receiving_status(self):
+        """Derive PO status from received quantities on the line items."""
+        if self.status == 'Cancelled':
+            return self.status
+
+        items = list(self.order_items.all())
+        if not items:
+            return self.status
+
+        total_ordered = sum((item.quantity_ordered for item in items), Decimal('0'))
+        total_received = sum((item.quantity_received for item in items), Decimal('0'))
+
+        if total_received <= 0:
+            return 'Draft' if self.status == 'Draft' else 'Sent'
+        if total_ordered > 0 and total_received >= total_ordered:
+            return 'Received'
+        return 'Partial'
+
     def generate_po_number(self):
         prefix = f"PO{timezone.now().strftime('%Y%m')}"
         last = PurchaseOrder.objects.filter(
@@ -1736,6 +1908,12 @@ class GoodReceiptNote(models.Model):
     - GET /sale/grns/ - List GRNs
     - POST /sale/grns/{id}/create-invoice/ - Convert to purchase invoice
     """
+    STATUS_CHOICES = [
+        ('Draft', 'Draft'),
+        ('Posted', 'Posted'),
+        ('Cancelled', 'Cancelled'),
+    ]
+
     grn_number = models.CharField(max_length=20, unique=True)
     purchase_order = models.ForeignKey(
         PurchaseOrder,
@@ -1758,6 +1936,8 @@ class GoodReceiptNote(models.Model):
     supplier_invoice_number = models.CharField(max_length=50, blank=True)
     supplier_invoice_date = models.DateField(null=True, blank=True)
     notes = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Draft')
+    posted_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(
         User,
@@ -1778,6 +1958,11 @@ class GoodReceiptNote(models.Model):
         if not self.grn_number:
             self.grn_number = self.generate_grn_number()
         super().save(*args, **kwargs)
+
+    def post_receipt(self, user=None):
+        from .services import post_good_receipt_note
+
+        return post_good_receipt_note(self, user=user)
 
     def generate_grn_number(self):
         prefix = f"GRN{timezone.now().strftime('%Y%m')}"
@@ -1968,38 +2153,85 @@ class PurchaseInvoice(models.Model):
             self.invoice_number = self.business_location.get_next_purchase_invoice_number()
         super().save(*args, **kwargs)
 
+    def calculate_totals(self):
+        """Rebuild purchase invoice totals from the stored line items."""
+        items = list(self.items.all())
+        sub_total = quantize_money(sum((item.taxable_amount for item in items), Decimal('0')))
+        taxable_amount = quantize_money(sub_total - self.discount_amount)
+        cgst_amount = quantize_money(sum((item.cgst_amount for item in items), Decimal('0')))
+        sgst_amount = quantize_money(sum((item.sgst_amount for item in items), Decimal('0')))
+        igst_amount = quantize_money(sum((item.igst_amount for item in items), Decimal('0')))
+        round_off = quantize_money(self.round_off or Decimal('0'))
+        grand_total = quantize_money(taxable_amount + cgst_amount + sgst_amount + igst_amount + round_off)
+
+        self.sub_total = sub_total
+        self.taxable_amount = taxable_amount
+        self.cgst_amount = cgst_amount
+        self.sgst_amount = sgst_amount
+        self.igst_amount = igst_amount
+        self.round_off = round_off
+        self.grand_total = grand_total
+        self.save(update_fields=[
+            'sub_total',
+            'discount_amount',
+            'taxable_amount',
+            'cgst_amount',
+            'sgst_amount',
+            'igst_amount',
+            'round_off',
+            'grand_total',
+        ])
+
     def finalize(self):
         """Finalize purchase invoice - add stock (Purchase type movement)."""
         with transaction.atomic():
             if self.status != 'Draft':
                 raise ValidationError(f"Cannot finalize purchase invoice with status '{self.status}'")
 
+            self.calculate_totals()
             self.status = 'Finalized'
             self.save(update_fields=['status'])
 
-            from stock.services import post_stock_movement
+            if not self.grn_id:
+                from stock.services import post_stock_movement
 
-            organization = self.business_location.organization
-            for item in self.items.all():
-                post_stock_movement(
-                    organization=organization,
-                    movement_type='Purchase',
-                    item=item.item,
-                    item_variant=item.item_variant,
-                    warehouse=self.business_location,
-                    quantity=item.quantity,
-                    rate=item.rate,
-                    cgst_rate=item.cgst_rate,
-                    sgst_rate=item.sgst_rate,
-                    igst_rate=item.igst_rate,
-                    total_amount=item.total,
-                    reference_number=self.invoice_number,
-                    status='Approved',
-                    source_document_type='sale.PurchaseInvoiceItem',
-                    source_document_id=item.pk,
-                    source_line_reference=item.pk,
-                    notes='Purchase invoice finalization',
-                )
+                organization = self.business_location.organization
+                for item in self.items.all():
+                    post_stock_movement(
+                        organization=organization,
+                        movement_type='Purchase',
+                        item=item.item,
+                        item_variant=item.item_variant,
+                        warehouse=self.business_location,
+                        quantity=item.quantity,
+                        rate=item.rate,
+                        cgst_rate=item.cgst_rate,
+                        sgst_rate=item.sgst_rate,
+                        igst_rate=item.igst_rate,
+                        total_amount=item.total,
+                        reference_number=self.invoice_number,
+                        status='Approved',
+                        source_document_type='sale.PurchaseInvoiceItem',
+                        source_document_id=item.pk,
+                        source_line_reference=item.pk,
+                        notes='Purchase invoice finalization',
+                    )
+            else:
+                from .services import post_good_receipt_note
+
+                post_good_receipt_note(self.grn)
+
+            from accounting.services import post_purchase_invoice
+            post_purchase_invoice(self)
+
+    def cancel(self, user=None):
+        with transaction.atomic():
+            if self.status != 'Finalized':
+                raise ValidationError(f"Cannot cancel purchase invoice with status '{self.status}'")
+            self.status = 'Cancelled'
+            self.save(update_fields=['status'])
+            from accounting.services import post_purchase_invoice_cancellation
+            post_purchase_invoice_cancellation(self, user=user)
 
 
 class PurchaseInvoiceItem(models.Model):
@@ -2117,6 +2349,7 @@ class DebitNote(models.Model):
     )
 
     def save(self, *args, **kwargs):
+        created = self.pk is None
         if not self.debit_note_number:
             prefix = f"DN{timezone.now().strftime('%Y%m%d')}"
             last = DebitNote.objects.filter(
@@ -2131,6 +2364,9 @@ class DebitNote(models.Model):
             else:
                 self.debit_note_number = f"{prefix}0001"
         super().save(*args, **kwargs)
+        if created and self.amount:
+            from accounting.services import post_debit_note
+            post_debit_note(self)
 
     def calculate_totals(self):
         total = sum(item.refund_amount for item in self.items.all())
@@ -2238,6 +2474,7 @@ class PaymentOut(models.Model):
     )
 
     def save(self, *args, **kwargs):
+        created = self.pk is None
         if not self.payment_number:
             prefix = f"PAY{timezone.now().strftime('%Y%m%d')}"
             last = PaymentOut.objects.filter(
@@ -2252,3 +2489,6 @@ class PaymentOut(models.Model):
             else:
                 self.payment_number = f"{prefix}0001"
         super().save(*args, **kwargs)
+        if created and self.amount:
+            from accounting.services import post_payment_out
+            post_payment_out(self)

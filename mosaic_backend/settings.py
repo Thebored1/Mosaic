@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     'commerce',
     'stock',
     'sale',
+    'accounting',
     'configuration',
     'pos',
     'audit.apps.AuditConfig',
