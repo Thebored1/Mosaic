@@ -8,7 +8,7 @@ and stable read models for reporting screens.
 
 from rest_framework import serializers
 
-from .models import Expense, FiscalPeriod, JournalEntry, JournalLine, LedgerAccount, PostingBatch, Reconciliation
+from .models import BankAccount, ChequeTransaction, Expense, FiscalPeriod, JournalEntry, JournalLine, LedgerAccount, PostingBatch, Reconciliation
 
 
 class LedgerAccountSerializer(serializers.ModelSerializer):
@@ -59,6 +59,38 @@ class ReconciliationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Reconciliation
         fields = ['id', 'organization', 'account', 'statement_date', 'statement_balance', 'system_balance', 'variance', 'status', 'notes', 'created_at', 'created_by']
+
+
+class BankAccountSerializer(serializers.ModelSerializer):
+    """Serialize bank account masters."""
+
+    organization = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = BankAccount
+        fields = [
+            'id', 'organization', 'name', 'bank_name', 'branch_name', 'account_number',
+            'ifsc_code', 'account_type', 'is_active', 'notes', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class ChequeTransactionSerializer(serializers.ModelSerializer):
+    """Serialize cheque tracking records."""
+
+    organization = serializers.PrimaryKeyRelatedField(read_only=True)
+    bank_account_name = serializers.CharField(source='bank_account.name', read_only=True)
+    party_name = serializers.CharField(source='party.name', read_only=True)
+
+    class Meta:
+        model = ChequeTransaction
+        fields = [
+            'id', 'organization', 'bank_account', 'bank_account_name', 'party', 'party_name',
+            'cheque_number', 'cheque_date', 'amount', 'transaction_type', 'status',
+            'deposited_at', 'cleared_at', 'bounced_at', 'cancelled_at', 'notes',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'deposited_at', 'cleared_at', 'bounced_at', 'cancelled_at', 'created_at', 'updated_at']
 
 
 class ExpenseSerializer(serializers.ModelSerializer):

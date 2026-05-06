@@ -7,7 +7,10 @@ the system, so they enforce tenant boundaries and document transitions
 carefully.
 """
 
-from rest_framework import viewsets, status
+import csv
+import io
+import logging
+from rest_framework import serializers, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
@@ -16,8 +19,12 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.db.models import Sum, Count, Q
 from django.db import transaction
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
+from django.http import HttpResponse
 from decimal import Decimal
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema, extend_schema_view, inline_serializer
 
 from configuration.models import State, Warehouse as BusinessLocation
 from configuration.authentication import SUPER_ADMIN_MARKER, ECOMMERCE_MARKER, ScopedRolePermission
@@ -33,7 +40,12 @@ from .models import (
     DebitNote, PaymentOut,
     PriceList, Quotation
 )
-from .services import post_good_receipt_note
+from .services import (
+    generate_invoice_documents,
+    generate_invoice_e_invoice,
+    generate_invoice_e_way_bill,
+    post_good_receipt_note,
+)
 from .serializers import (
     StateSerializer, BusinessLocationSerializer, PartySerializer,
     OrderSerializer, OrderCreateSerializer,
@@ -48,6 +60,25 @@ from .serializers import (
     PurchaseInvoiceListSerializer, PurchaseInvoiceDetailSerializer,
     DebitNoteSerializer, PaymentOutSerializer
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _validation_detail(exc):
+    """Normalize Django/DRF validation exceptions into response-safe payloads."""
+    return getattr(exc, 'message_dict', None) or getattr(exc, 'detail', None) or getattr(exc, 'messages', None) or {'detail': str(exc)}
+
+
+def csv_response(filename, rows):
+    """Return a CSV export response."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    for row in rows:
+        writer.writerow(row)
+    response = HttpResponse(buffer.getvalue(), content_type='text/csv')
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
 
 
 class StandardPagination(PageNumberPagination):
@@ -65,6 +96,14 @@ def org_filter(qs, request):
         return qs.none()
 
     model_fields = {field.name for field in qs.model._meta.get_fields()}
+
+    if qs.model is State:
+        if request.auth == SUPER_ADMIN_MARKER:
+            org_id = request.query_params.get('organization')
+            if org_id:
+                return qs.filter(Q(organization_id=org_id) | Q(organization__isnull=True))
+            return qs
+        return qs.filter(Q(organization=request.auth) | Q(organization__isnull=True))
 
     if request.auth == SUPER_ADMIN_MARKER:
         org_id = request.query_params.get('organization')
@@ -89,14 +128,22 @@ def org_filter(qs, request):
         return qs.filter(invoice__business_location__organization=request.auth)
     if 'purchase_invoice' in model_fields:
         return qs.filter(purchase_invoice__business_location__organization=request.auth)
-    if qs.model is State:
-        return qs
     return qs.none()
 
 
 def finalized_invoices(qs):
     """Limit a queryset to finalized sales invoices."""
     return qs.filter(status='Finalized')
+
+
+def format_report_decimal(value):
+    """Format report totals without trailing zeroes for whole numbers."""
+    if value is None:
+        return '0'
+    text = format(Decimal(value), 'f')
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    return text or '0'
 
 
 def save_for_request_organization(serializer, request):
@@ -210,6 +257,88 @@ class PartyViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         save_for_request_organization(serializer, self.request)
+
+    @action(detail=False, methods=['get'])
+    def export(self, request):
+        """Export party masters as CSV."""
+        rows = [['name', 'party_type', 'gstin', 'phone', 'email', 'is_active', 'credit_limit', 'opening_balance']]
+        for party in self.get_queryset():
+            rows.append([
+                party.name,
+                party.party_type,
+                party.gstin,
+                party.phone,
+                party.email,
+                str(party.is_active),
+                str(party.credit_limit),
+                str(party.opening_balance),
+            ])
+        return csv_response('parties.csv', rows)
+
+    @action(detail=False, methods=['get'])
+    def import_template(self, request):
+        """Return a CSV template for party imports."""
+        rows = [[
+            'name', 'party_type', 'gstin', 'phone', 'email', 'address',
+            'shipping_address', 'credit_limit', 'opening_balance', 'is_active'
+        ]]
+        return csv_response('parties-template.csv', rows)
+
+    @action(detail=False, methods=['post'])
+    def bulk_import(self, request):
+        """Import party rows in a transaction with validation feedback."""
+        rows = request.data.get('parties')
+        if not isinstance(rows, list):
+            raise ValidationError({'parties': 'parties must be a list of row objects'})
+
+        errors = []
+        prepared = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                errors.append({'row': index, 'error': 'Each row must be an object'})
+                continue
+            name = (row.get('name') or '').strip()
+            if not name:
+                errors.append({'row': index, 'error': 'name is required'})
+                continue
+            try:
+                prepared.append({
+                    'row': index,
+                    'name': name,
+                    'party_type': row.get('party_type', 'Customer'),
+                    'gstin': (row.get('gstin') or '').upper(),
+                    'phone': row.get('phone', ''),
+                    'email': row.get('email', ''),
+                    'address': row.get('address', ''),
+                    'shipping_address': row.get('shipping_address', ''),
+                    'credit_limit': Decimal(str(row.get('credit_limit', '0'))),
+                    'opening_balance': Decimal(str(row.get('opening_balance', '0'))),
+                    'is_active': str(row.get('is_active', True)).lower() not in {'false', '0', 'no'},
+                })
+            except Exception as exc:
+                errors.append({'row': index, 'error': str(exc)})
+
+        if errors:
+            raise ValidationError({'rows': errors})
+
+        imported = []
+        org = request.auth if request.auth != SUPER_ADMIN_MARKER else None
+        with transaction.atomic():
+            for row in prepared:
+                defaults = {
+                    'party_type': row['party_type'],
+                    'gstin': row['gstin'],
+                    'phone': row['phone'],
+                    'email': row['email'],
+                    'address': row['address'],
+                    'shipping_address': row['shipping_address'],
+                    'credit_limit': row['credit_limit'],
+                    'opening_balance': row['opening_balance'],
+                    'is_active': row['is_active'],
+                }
+                party, _ = Party.objects.update_or_create(name=row['name'], organization=org, defaults=defaults)
+                imported.append(PartySerializer(party).data)
+        return Response({'imported': imported}, status=201)
 
     @action(detail=True, methods=['get'])
     def ledger(self, request, pk=None):
@@ -708,11 +837,18 @@ class InvoiceViewSet(viewsets.ModelViewSet):
                 'message': 'Invoice finalized successfully',
                 'invoice_number': invoice.invoice_number
             })
-        except Exception as e:
+        except (ValidationError, DjangoValidationError) as exc:
             return Response(
-                {'error': str(e)},
+                _validation_detail(exc),
                 status=status.HTTP_400_BAD_REQUEST
             )
+        except Exception:
+            logger.exception(
+                'Unexpected error finalizing invoice %s for organization %s',
+                invoice.pk,
+                getattr(invoice.business_location, 'organization_id', None),
+            )
+            return Response({'detail': 'Unexpected error while finalizing invoice.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
@@ -740,11 +876,18 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         try:
             invoice.cancel(request.user)
             return Response({'message': 'Invoice cancelled successfully'})
-        except Exception as e:
+        except (ValidationError, DjangoValidationError) as exc:
             return Response(
-                {'error': str(e)},
+                _validation_detail(exc),
                 status=status.HTTP_400_BAD_REQUEST
             )
+        except Exception:
+            logger.exception(
+                'Unexpected error cancelling invoice %s for organization %s',
+                invoice.pk,
+                getattr(invoice.business_location, 'organization_id', None),
+            )
+            return Response({'detail': 'Unexpected error while cancelling invoice.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['get'])
     def print_data(self, request, pk=None):
@@ -762,6 +905,68 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         }
 
         return Response(data)
+
+    @action(detail=True, methods=['post'])
+    @extend_schema(
+        responses=inline_serializer(
+            name='InvoiceEWayBillResponse',
+            fields={
+                'message': serializers.CharField(),
+                'e_way_bill': serializers.CharField(),
+            },
+        )
+    )
+    def generate_e_way_bill(self, request, pk=None):
+        """Generate and store a placeholder e-way bill number."""
+        invoice = self.get_object()
+        try:
+            e_way_bill = generate_invoice_e_way_bill(invoice)
+        except (ValidationError, DjangoValidationError) as exc:
+            raise ValidationError(getattr(exc, 'message_dict', exc.messages))
+        return Response({'message': 'E-way bill generated successfully', 'e_way_bill': e_way_bill})
+
+    @action(detail=True, methods=['post'])
+    @extend_schema(
+        responses=inline_serializer(
+            name='InvoiceEInvoiceResponse',
+            fields={
+                'message': serializers.CharField(),
+                'e_invoice_details': serializers.JSONField(),
+            },
+        )
+    )
+    def generate_e_invoice(self, request, pk=None):
+        """Generate and store a placeholder e-invoice payload."""
+        invoice = self.get_object()
+        try:
+            details = generate_invoice_e_invoice(invoice)
+        except (ValidationError, DjangoValidationError) as exc:
+            raise ValidationError(getattr(exc, 'message_dict', exc.messages))
+        return Response({'message': 'E-invoice generated successfully', 'e_invoice_details': details})
+
+    @action(detail=True, methods=['post'])
+    @extend_schema(
+        responses=inline_serializer(
+            name='InvoiceDocumentsResponse',
+            fields={
+                'message': serializers.CharField(),
+                'e_way_bill': serializers.CharField(),
+                'e_invoice_details': serializers.JSONField(),
+            },
+        )
+    )
+    def generate_documents(self, request, pk=None):
+        """Generate both e-way bill and e-invoice data in one call."""
+        invoice = self.get_object()
+        try:
+            payload = generate_invoice_documents(invoice)
+        except ValidationError as exc:
+            raise ValidationError(getattr(exc, 'message_dict', exc.messages))
+        return Response({
+            'message': 'GST documents generated successfully',
+            'e_way_bill': payload['e_way_bill'],
+            'e_invoice_details': payload['e_invoice_details'],
+        })
 
     def _number_to_words(self, number):
         """Convert number to words for bill printing."""
@@ -994,8 +1199,15 @@ class PurchaseInvoiceViewSet(viewsets.ModelViewSet):
         try:
             pi.finalize()
             return Response({'message': 'Purchase invoice finalized'})
-        except Exception as e:
-            return Response({'error': str(e)}, status=400)
+        except ValidationError as exc:
+            return Response(_validation_detail(exc), status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            logger.exception(
+                'Unexpected error finalizing purchase invoice %s for organization %s',
+                pi.pk,
+                getattr(pi.business_location, 'organization_id', None),
+            )
+            return Response({'detail': 'Unexpected error while finalizing purchase invoice.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
@@ -1007,8 +1219,15 @@ class PurchaseInvoiceViewSet(viewsets.ModelViewSet):
 
         try:
             pi.cancel(user=request.user)
-        except Exception as e:
-            return Response({'error': str(e)}, status=400)
+        except ValidationError as exc:
+            return Response(_validation_detail(exc), status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            logger.exception(
+                'Unexpected error cancelling purchase invoice %s for organization %s',
+                pi.pk,
+                getattr(pi.business_location, 'organization_id', None),
+            )
+            return Response({'detail': 'Unexpected error while cancelling purchase invoice.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         return Response({'message': 'Purchase invoice cancelled'})
 
 
@@ -1035,7 +1254,7 @@ class PaymentOutViewSet(viewsets.ModelViewSet):
     permission_scope = 'purchase_operations'
     pagination_class = StandardPagination
     filter_backends = [DjangoFilterBackend, SearchFilter]
-    filterset_fields = ['purchase_invoice', 'supplier', 'business_location']
+    filterset_fields = ['supplier', 'business_location']
     search_fields = ['payment_number', 'reference_number']
     ordering = ['-transaction_date']
 
@@ -1054,6 +1273,14 @@ class PaymentOutViewSet(viewsets.ModelViewSet):
 
 # ===================== REPORTS =====================
 
+@extend_schema_view(
+    daily_sales=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    gst_register=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    gstr1=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    gstr2=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    gst_liability=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    itc_reconciliation=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+)
 class ReportsViewSet(viewsets.ViewSet):
     """Reporting viewset for operational and GST summaries."""
 
@@ -1082,9 +1309,9 @@ class ReportsViewSet(viewsets.ViewSet):
         return Response({
             'date': str(date),
             'invoice_count': invoices['total_items'] or 0,
-            'total_sales': str(invoices['total_sales'] or 0),
-            'total_tax': str(invoices['total_tax'] or 0),
-            'total_receipts': str(receipts['total_receipts'] or 0)
+            'total_sales': format_report_decimal(invoices['total_sales']),
+            'total_tax': format_report_decimal(invoices['total_tax']),
+            'total_receipts': format_report_decimal(receipts['total_receipts']),
         })
 
     @action(detail=False, methods=['get'])
@@ -1148,6 +1375,75 @@ class ReportsViewSet(viewsets.ViewSet):
                 })
 
         return Response({'gstr1_data': data})
+
+    @action(detail=False, methods=['get'])
+    def gstr2(self, request):
+        """GSTR-2 format inward supply summary."""
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        purchases = org_filter(PurchaseInvoice.objects.filter(status='Finalized'), request)
+        if start_date:
+            purchases = purchases.filter(invoice_date__date__gte=start_date)
+        if end_date:
+            purchases = purchases.filter(invoice_date__date__lte=end_date)
+
+        rows = []
+        for pi in purchases.select_related('supplier'):
+            rows.append({
+                'invoice_number': pi.invoice_number,
+                'invoice_date': pi.invoice_date.strftime('%Y-%m-%d'),
+                'supplier_name': pi.supplier.name if pi.supplier else '',
+                'supplier_gstin': pi.supplier.gstin if pi.supplier else '',
+                'taxable_amount': str(pi.taxable_amount),
+                'cgst_amount': str(pi.cgst_amount),
+                'sgst_amount': str(pi.sgst_amount),
+                'igst_amount': str(pi.igst_amount),
+                'grand_total': str(pi.grand_total),
+            })
+        return Response({'gstr2_data': rows})
+
+    @action(detail=False, methods=['get'])
+    def gst_liability(self, request):
+        """Return a simple GST liability summary."""
+        sales = org_filter(finalized_invoices(Invoice.objects.all()), request).aggregate(
+            taxable=Sum('taxable_amount'),
+            cgst=Sum('cgst_amount'),
+            sgst=Sum('sgst_amount'),
+            igst=Sum('igst_amount'),
+        )
+        purchases = org_filter(PurchaseInvoice.objects.filter(status='Finalized'), request).aggregate(
+            taxable=Sum('taxable_amount'),
+            cgst=Sum('cgst_amount'),
+            sgst=Sum('sgst_amount'),
+            igst=Sum('igst_amount'),
+        )
+        sales_tax = (sales['cgst'] or Decimal('0')) + (sales['sgst'] or Decimal('0')) + (sales['igst'] or Decimal('0'))
+        input_tax = (purchases['cgst'] or Decimal('0')) + (purchases['sgst'] or Decimal('0')) + (purchases['igst'] or Decimal('0'))
+        return Response({
+            'sales_tax': str(sales_tax),
+            'input_tax_credit': str(input_tax),
+            'net_liability': str(sales_tax - input_tax),
+        })
+
+    @action(detail=False, methods=['get'])
+    def itc_reconciliation(self, request):
+        """Return a basic input tax credit reconciliation summary."""
+        purchases = org_filter(PurchaseInvoice.objects.filter(status='Finalized'), request)
+        debit_notes = org_filter(DebitNote.objects.all(), request)
+        itc = purchases.aggregate(
+            cgst=Sum('cgst_amount'),
+            sgst=Sum('sgst_amount'),
+            igst=Sum('igst_amount'),
+        )
+        reversed_itc = debit_notes.aggregate(
+            cgst=Sum('amount'),
+        )
+        total_itc = (itc['cgst'] or Decimal('0')) + (itc['sgst'] or Decimal('0')) + (itc['igst'] or Decimal('0'))
+        return Response({
+            'eligible_itc': str(total_itc),
+            'reversed_itc': str(reversed_itc['cgst'] or Decimal('0')),
+            'net_itc': str(total_itc - (reversed_itc['cgst'] or Decimal('0'))),
+        })
 
 
 class PriceListViewSet(viewsets.ModelViewSet):

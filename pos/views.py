@@ -7,14 +7,17 @@ existing sale and stock models for accounting and inventory posting.
 """
 
 from decimal import Decimal
+import logging
 
 from django.core.exceptions import ValidationError
 from rest_framework import decorators, status, viewsets
 from rest_framework.response import Response
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema
 
 from account.models import Organization
 from sale.models import Invoice
-from sale.serializers import OrderSerializer, ReceiptSerializer
+from sale.serializers import InvoiceDetailSerializer, OrderSerializer, ReceiptSerializer
 
 from configuration.authentication import (
     ECOMMERCE_MARKER,
@@ -29,6 +32,9 @@ from .services import (
     build_shift_reconciliation,
     checkout_pos_order,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _get_request_organization(request):
@@ -109,10 +115,17 @@ class ShiftViewSet(viewsets.ModelViewSet):
         
         try:
             result = shift.close(closing_cash)
-        except Exception as e:
+        except ValidationError as exc:
+            detail = getattr(exc, 'message_dict', None) or getattr(exc, 'messages', None) or [str(exc)]
             return Response(
-                {'detail': str(e)},
+                {'detail': detail},
                 status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception:
+            logger.exception('Unexpected error while closing shift %s', shift.pk)
+            return Response(
+                {'detail': 'Unexpected error while closing shift.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
         
         serializer = self.get_serializer(shift)
@@ -209,6 +222,7 @@ class POSCheckoutViewSet(viewsets.ViewSet):
     permission_classes = [ScopedRolePermission]
     permission_scope = 'pos_operations'
 
+    @extend_schema(request=POSCheckoutSerializer, responses=OpenApiTypes.OBJECT)
     def create(self, request):
         serializer = POSCheckoutSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -253,6 +267,8 @@ class POSCheckoutViewSet(viewsets.ViewSet):
 class POSInvoiceViewSet(viewsets.ViewSet):
     """Expose invoice print/share payloads for POS terminals."""
 
+    queryset = Invoice.objects.select_related('party', 'business_location', 'billing_state', 'created_by').prefetch_related('items')
+    serializer_class = InvoiceDetailSerializer
     permission_classes = [ScopedRolePermission]
     permission_scope = 'pos_operations'
 
@@ -265,6 +281,7 @@ class POSInvoiceViewSet(viewsets.ViewSet):
             return queryset.none()
         return queryset.filter(business_location__organization=organization)
 
+    @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
     def retrieve(self, request, pk=None):
         try:
             invoice = self._get_queryset(request).get(pk=pk)
@@ -273,6 +290,7 @@ class POSInvoiceViewSet(viewsets.ViewSet):
         return Response(build_invoice_document_payload(invoice))
 
     @decorators.action(detail=True, methods=['get'])
+    @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
     def print_data(self, request, pk=None):
         try:
             invoice = self._get_queryset(request).get(pk=pk)
@@ -281,6 +299,7 @@ class POSInvoiceViewSet(viewsets.ViewSet):
         return Response(build_invoice_document_payload(invoice))
 
     @decorators.action(detail=True, methods=['get'])
+    @extend_schema(request=None, responses=OpenApiTypes.OBJECT)
     def share(self, request, pk=None):
         try:
             invoice = self._get_queryset(request).get(pk=pk)

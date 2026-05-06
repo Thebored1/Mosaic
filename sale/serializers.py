@@ -44,6 +44,7 @@ class StateSerializer(serializers.ModelSerializer):
     class Meta:
         model = State
         fields = ['id', 'name', 'state_code', 'is_active']
+        ref_name = 'SaleState'
 
 
 class BusinessLocationSerializer(serializers.ModelSerializer):
@@ -606,7 +607,7 @@ class InvoiceDetailSerializer(serializers.ModelSerializer):
             'taxable_amount', 'tcs_rate', 'tcs_amount', 'gross_profit_amount', 'cgst_amount', 'sgst_amount', 'igst_amount',
             'round_off', 'grand_total', 'tax_summary',
             'notes', 'terms', 'status',
-            'e_way_bill', 'order', 'created_at', 'created_by', 'created_by_name'
+            'e_way_bill', 'e_invoice_details', 'order', 'created_at', 'created_by', 'created_by_name'
         ]
 
 
@@ -746,7 +747,7 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PurchaseOrderItem
-        fields = ['id', 'item', 'item_name', 'item_sku', 'item_variant', 'quantity_order', 'quantity_received', 'unit', 'rate', 'discount', 'total']
+        fields = ['id', 'item', 'item_name', 'item_sku', 'item_variant', 'quantity_ordered', 'quantity_received', 'unit', 'rate', 'discount', 'total']
 
 
 class PurchaseOrderListSerializer(serializers.ModelSerializer):

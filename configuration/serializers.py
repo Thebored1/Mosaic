@@ -12,7 +12,7 @@ SuperAdminTokenSerializer - Serializer for super admin tokens
 """
 
 from rest_framework import serializers
-from .models import State, Warehouse, ApiToken, SuperAdminToken
+from .models import State, Warehouse, TenantSettings, ApiToken, SuperAdminToken
 
 
 class StateSerializer(serializers.ModelSerializer):
@@ -20,6 +20,7 @@ class StateSerializer(serializers.ModelSerializer):
     class Meta:
         model = State
         fields = ['id', 'name', 'state_code', 'is_active']
+        ref_name = 'ConfigurationState'
 
 
 class WarehouseSerializer(serializers.ModelSerializer):
@@ -69,6 +70,32 @@ class WarehouseSerializer(serializers.ModelSerializer):
         if is_default and not self.instance:
             Warehouse.objects.filter(is_default=True).update(is_default=False)
         return attrs
+
+
+class TenantSettingsSerializer(serializers.ModelSerializer):
+    """Serializer for tenant-wide operational settings."""
+
+    default_warehouse_name = serializers.CharField(source='default_warehouse.name', read_only=True)
+    organization_name = serializers.CharField(source='organization.name', read_only=True)
+
+    class Meta:
+        model = TenantSettings
+        fields = [
+            'id',
+            'organization',
+            'organization_name',
+            'default_warehouse',
+            'default_warehouse_name',
+            'email_notifications_enabled',
+            'sms_notifications_enabled',
+            'invoice_print_template',
+            'receipt_print_template',
+            'delivery_note_print_template',
+            'fiscal_year_start_month',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
 
 
 class ApiTokenSerializer(serializers.ModelSerializer):

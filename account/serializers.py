@@ -16,6 +16,8 @@ from django.db import transaction
 from django.contrib.auth import authenticate
 from rest_framework import serializers
 from django.contrib.auth.models import User
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
 from .models import Merchant, Customer, UserAccount, Organization
 from configuration.models import ApiToken
 from configuration.authentication import SUPER_ADMIN_MARKER, ECOMMERCE_MARKER
@@ -174,6 +176,7 @@ class UserAccountWithTokenSerializer(serializers.ModelSerializer):
         model = UserAccount
         fields = ['id', 'username', 'email', 'role', 'phone', 'is_active', 'token']
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_token(self, obj):
         return getattr(obj, '_raw_api_token', None)
 
@@ -264,6 +267,7 @@ class OrganizationOnboardingResponseSerializer(serializers.Serializer):
     owner = serializers.SerializerMethodField()
     token = serializers.SerializerMethodField()
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_organization(self, obj):
         """Return a stable organization payload for onboarding responses."""
         organization = getattr(obj, '_onboarding_organization', obj.organization)
@@ -280,6 +284,7 @@ class OrganizationOnboardingResponseSerializer(serializers.Serializer):
             'updated_at': organization.updated_at,
         }
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_owner(self, obj):
         """Return the freshly created owner account payload."""
         user = obj.user
@@ -297,6 +302,7 @@ class OrganizationOnboardingResponseSerializer(serializers.Serializer):
             'updated_at': obj.updated_at,
         }
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_token(self, obj):
         """Return the raw token attached during onboarding."""
         return getattr(obj, '_raw_api_token', None)
@@ -313,6 +319,7 @@ class AuthSessionSerializer(serializers.Serializer):
     account = serializers.SerializerMethodField()
     token = serializers.SerializerMethodField()
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_organization(self, obj):
         """Return organization details or None for ecommerce-only accounts."""
         organization = obj.organization
@@ -331,6 +338,7 @@ class AuthSessionSerializer(serializers.Serializer):
             'updated_at': organization.updated_at,
         }
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_account(self, obj):
         """Return the authenticated account profile."""
         user = obj.user
@@ -349,6 +357,7 @@ class AuthSessionSerializer(serializers.Serializer):
             'updated_at': obj.updated_at,
         }
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_token(self, obj):
         """Return the raw token generated during login or refresh."""
         return getattr(obj, '_raw_api_token', None)
@@ -501,6 +510,7 @@ class AccountMeSerializer(serializers.Serializer):
     account = serializers.SerializerMethodField()
     organization = serializers.SerializerMethodField()
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_user(self, obj):
         """Return the underlying Django auth user details."""
         return {
@@ -511,6 +521,7 @@ class AccountMeSerializer(serializers.Serializer):
             'last_name': obj.user.last_name,
         }
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_account(self, obj):
         """Return the application account details."""
         return {
@@ -522,6 +533,7 @@ class AccountMeSerializer(serializers.Serializer):
             'is_active': obj.is_active,
         }
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_organization(self, obj):
         """Return the organization payload when the account belongs to one."""
         if obj.organization is None:
@@ -533,3 +545,29 @@ class AccountMeSerializer(serializers.Serializer):
             'gstin': obj.organization.gstin,
             'is_active': obj.organization.is_active,
         }
+
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    """Validate a password-reset request identifier."""
+
+    identifier = serializers.CharField(help_text='Username or email address')
+
+
+class PasswordResetRequestResponseSerializer(serializers.Serializer):
+    """Shape the password-reset request response."""
+
+    status = serializers.CharField()
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    """Validate a password-reset confirmation payload."""
+
+    uid = serializers.CharField()
+    token = serializers.CharField()
+    new_password = serializers.CharField(min_length=8)
+
+
+class PasswordResetConfirmResponseSerializer(serializers.Serializer):
+    """Shape the password-reset confirmation response."""
+
+    status = serializers.CharField()

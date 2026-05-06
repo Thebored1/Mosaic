@@ -257,6 +257,8 @@ class ShopperAddressViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return only the authenticated account's saved addresses."""
+        if getattr(self, 'swagger_fake_view', False):
+            return ShopperAddress.objects.none()
         if self.request.auth == SUPER_ADMIN_MARKER:
             return ShopperAddress.objects.none()
         account = current_account(self.request)
@@ -282,6 +284,8 @@ class CartViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
 
     def get_queryset(self):
         """Return the active cart for the authenticated account and channel."""
+        if getattr(self, 'swagger_fake_view', False):
+            return Cart.objects.none()
         if self.request.auth == SUPER_ADMIN_MARKER:
             return Cart.objects.none()
         account = current_account(self.request)
@@ -312,6 +316,20 @@ class CartViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
 
         account = current_account(request)
         channel = request.data.get('channel') or request.query_params.get('channel') or 'b2c'
+        idempotency_key = (
+            request.headers.get('Idempotency-Key')
+            or request.data.get('idempotency_key')
+            or request.query_params.get('idempotency_key')
+            or ''
+        ).strip()
+        if idempotency_key:
+            existing_order = CommerceOrder.objects.filter(checkout_idempotency_key=idempotency_key).first()
+            if existing_order is not None:
+                return Response(
+                    CommerceOrderSerializer(existing_order, context={'request': request}).data,
+                    status=status.HTTP_201_CREATED,
+                )
+
         cart = Cart.current_for_account(account, channel=channel)
         serializer = CartCheckoutSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
@@ -320,6 +338,7 @@ class CartViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
             billing_address=serializer.validated_data.get('billing_address'),
             shipping_address=serializer.validated_data.get('shipping_address'),
             notes=serializer.validated_data.get('notes', ''),
+            checkout_idempotency_key=idempotency_key,
         )
         response_serializer = CommerceOrderSerializer(order, context={'request': request})
         record_audit_event(request, 'commerce.order.checkout', order, {'channel': channel})
@@ -340,6 +359,8 @@ class CartItemViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return the line items that belong to the current active cart."""
+        if getattr(self, 'swagger_fake_view', False):
+            return CartItem.objects.none()
         if self.request.auth == SUPER_ADMIN_MARKER:
             return CartItem.objects.none()
         account = current_account(self.request)
@@ -399,6 +420,8 @@ class CommerceOrderViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, vie
 
     def get_queryset(self):
         """Return the correct order history for the current principal."""
+        if getattr(self, 'swagger_fake_view', False):
+            return CommerceOrder.objects.none()
         if self.request.auth == SUPER_ADMIN_MARKER:
             return CommerceOrder.objects.all().prefetch_related('lines', 'lines__organization')
         account = current_account(self.request)
@@ -438,6 +461,8 @@ class SellerOrderViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, views
 
     def get_queryset(self):
         """Return orders that contain at least one line for the seller."""
+        if getattr(self, 'swagger_fake_view', False):
+            return CommerceOrder.objects.none()
         queryset = CommerceOrder.objects.prefetch_related('lines', 'lines__organization').distinct()
         if self.request.auth == SUPER_ADMIN_MARKER:
             org_id = self.request.query_params.get('organization')
@@ -462,6 +487,7 @@ class CommerceSettingsViewSet(mixins.RetrieveModelMixin, mixins.UpdateModelMixin
     """
 
     serializer_class = CommerceSettingsSerializer
+    queryset = CommerceSettings.objects.all()
     permission_classes = [ScopedRolePermission]
     permission_scope = 'commerce_settings'
 
@@ -498,6 +524,8 @@ class CommercePriceOverrideViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return price overrides for the current seller or requested tenant."""
+        if getattr(self, 'swagger_fake_view', False):
+            return CommercePriceOverride.objects.none()
         queryset = CommercePriceOverride.objects.select_related('seller_organization', 'buyer_organization', 'listing').all()
         if self.request.auth == SUPER_ADMIN_MARKER:
             org_id = self.request.query_params.get('organization')
@@ -547,6 +575,8 @@ class CommerceShipmentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return shipment rows visible to the current principal."""
+        if getattr(self, 'swagger_fake_view', False):
+            return CommerceShipment.objects.none()
         queryset = CommerceShipment.objects.select_related('organization', 'order').all()
         if self.request.auth == SUPER_ADMIN_MARKER:
             org_id = self.request.query_params.get('organization')
@@ -636,6 +666,8 @@ class CommerceReturnRequestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return return requests visible to the current principal."""
+        if getattr(self, 'swagger_fake_view', False):
+            return CommerceReturnRequest.objects.none()
         queryset = CommerceReturnRequest.objects.select_related('organization', 'order', 'shipment', 'order_line').all()
         if self.request.auth == SUPER_ADMIN_MARKER:
             org_id = self.request.query_params.get('organization')
@@ -699,6 +731,8 @@ class CommerceRefundViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return refunds visible to the current principal."""
+        if getattr(self, 'swagger_fake_view', False):
+            return CommerceRefund.objects.none()
         queryset = CommerceRefund.objects.select_related('organization', 'order', 'return_request').all()
         if self.request.auth == SUPER_ADMIN_MARKER:
             org_id = self.request.query_params.get('organization')
@@ -737,6 +771,8 @@ class WishlistViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
 
     def get_queryset(self):
         """Return wishlists owned by the authenticated account."""
+        if getattr(self, 'swagger_fake_view', False):
+            return Wishlist.objects.none()
         if self.request.auth == SUPER_ADMIN_MARKER:
             return Wishlist.objects.none()
         account = current_account(self.request)
@@ -764,6 +800,8 @@ class WishlistItemViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return wishlist items belonging to the authenticated account."""
+        if getattr(self, 'swagger_fake_view', False):
+            return WishlistItem.objects.none()
         if self.request.auth == SUPER_ADMIN_MARKER:
             return WishlistItem.objects.none()
         account = current_account(self.request)
@@ -805,6 +843,8 @@ class ProductReviewViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return approved reviews plus the authenticated buyer's own reviews."""
+        if getattr(self, 'swagger_fake_view', False):
+            return ProductReview.objects.none()
         if self.request.auth == SUPER_ADMIN_MARKER:
             return ProductReview.objects.select_related('listing', 'user_account').all()
 
@@ -849,6 +889,8 @@ class CommerceContentPageViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return storefront pages visible to the current request context."""
+        if getattr(self, 'swagger_fake_view', False):
+            return CommerceContentPage.objects.none()
         queryset = CommerceContentPage.objects.select_related('organization').all()
         org_id = self.request.query_params.get('organization')
         if org_id:
@@ -894,6 +936,8 @@ class CommerceNotificationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return notifications for the authenticated buyer or platform operator."""
+        if getattr(self, 'swagger_fake_view', False):
+            return CommerceNotification.objects.none()
         if self.request.auth == SUPER_ADMIN_MARKER:
             return CommerceNotification.objects.select_related('user_account', 'organization').all()
         account = current_account(self.request)
@@ -927,6 +971,8 @@ class CommerceAuditEventViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin
 
     def get_queryset(self):
         """Return audit events visible to the current request principal."""
+        if getattr(self, 'swagger_fake_view', False):
+            return CommerceAuditEvent.objects.none()
         queryset = CommerceAuditEvent.objects.select_related('organization', 'actor_account').all()
         if self.request.auth == SUPER_ADMIN_MARKER:
             org_id = self.request.query_params.get('organization')
@@ -953,6 +999,8 @@ class MarketplaceSettlementViewSet(mixins.ListModelMixin, mixins.RetrieveModelMi
 
     def get_queryset(self):
         """Return settlements visible to the current principal."""
+        if getattr(self, 'swagger_fake_view', False):
+            return MarketplaceSettlement.objects.none()
         queryset = MarketplaceSettlement.objects.select_related(
             'order',
             'seller_organization',
@@ -1002,6 +1050,8 @@ class MarketplacePayoutViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return payouts visible to the current principal."""
+        if getattr(self, 'swagger_fake_view', False):
+            return MarketplacePayout.objects.none()
         queryset = MarketplacePayout.objects.select_related('settlement', 'settlement__seller_organization').all()
         if self.request.auth == SUPER_ADMIN_MARKER:
             org_id = self.request.query_params.get('organization')

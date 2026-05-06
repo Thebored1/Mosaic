@@ -7,13 +7,16 @@ This module provides API views for configuration models.
 Views:
 ------
 WarehouseViewSet - CRUD operations for Warehouse model
+TenantSettingsViewSet - tenant-wide operational settings
 """
 
-from rest_framework import viewsets, decorators
+from django.db import transaction
+from django.db.models import Q
+from rest_framework import viewsets, decorators, status
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
-from .models import State, Warehouse
-from .serializers import StateSerializer, WarehouseSerializer
+from .models import State, Warehouse, TenantSettings
+from .serializers import StateSerializer, WarehouseSerializer, TenantSettingsSerializer
 from configuration.authentication import SUPER_ADMIN_MARKER, ECOMMERCE_MARKER, ScopedRolePermission
 
 
@@ -23,6 +26,14 @@ def org_filter(qs, request):
         return qs.none()
     if request.auth == ECOMMERCE_MARKER:
         return qs.none()
+
+    if qs.model is State:
+        if request.auth == SUPER_ADMIN_MARKER:
+            org_id = request.query_params.get('organization')
+            if org_id:
+                return qs.filter(Q(organization_id=org_id) | Q(organization__isnull=True))
+            return qs
+        return qs.filter(Q(organization=request.auth) | Q(organization__isnull=True))
 
     if request.auth == SUPER_ADMIN_MARKER:
         org_id = request.query_params.get('organization')
@@ -123,3 +134,48 @@ class WarehouseViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(warehouse)
         return Response(serializer.data)
+
+
+class TenantSettingsViewSet(viewsets.ModelViewSet):
+    """CRUD settings surface for tenant-wide operational defaults."""
+
+    serializer_class = TenantSettingsSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'tenant_settings'
+    http_method_names = ['get', 'post', 'put', 'patch', 'head', 'options']
+
+    def get_queryset(self):
+        return org_filter(TenantSettings.objects.select_related('organization', 'default_warehouse').all(), self.request)
+
+    def get_object(self):
+        org = self.request.query_params.get('organization') if self.request.auth == SUPER_ADMIN_MARKER else self.request.auth
+        if org is None:
+            raise ValidationError({'organization': 'organization is required'})
+        settings = TenantSettings.objects.select_related('organization', 'default_warehouse').filter(organization=org).first()
+        if settings is None:
+            settings = TenantSettings.objects.create(organization=org)
+        return settings
+
+    def create(self, request, *args, **kwargs):
+        with transaction.atomic():
+            instance = self.get_object()
+            serializer = self.get_serializer(instance, data=request.data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        with transaction.atomic():
+            instance = self.get_object()
+            serializer = self.get_serializer(instance, data=request.data, partial=False)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data)
+
+    def partial_update(self, request, *args, **kwargs):
+        with transaction.atomic():
+            instance = self.get_object()
+            serializer = self.get_serializer(instance, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data)

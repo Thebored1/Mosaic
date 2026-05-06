@@ -18,21 +18,49 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema, extend_schema_view
 
-from configuration.authentication import ScopedRolePermission
+from configuration.authentication import SUPER_ADMIN_MARKER, ScopedRolePermission
 from sale.models import Invoice, Receipt, PurchaseInvoice, PaymentOut, CreditNote, DebitNote
 
-from .models import Expense, FiscalPeriod, JournalEntry, JournalLine, LedgerAccount, PostingBatch, Reconciliation
-from .serializers import ExpenseSerializer, FiscalPeriodSerializer, JournalEntrySerializer, LedgerAccountSerializer, PostingBatchSerializer, ReconciliationSerializer
+from .models import BankAccount, ChequeTransaction, Expense, FiscalPeriod, JournalEntry, JournalLine, LedgerAccount, PostingBatch, Reconciliation
+from .serializers import (
+    BankAccountSerializer,
+    ChequeTransactionSerializer,
+    ExpenseSerializer,
+    FiscalPeriodSerializer,
+    JournalEntrySerializer,
+    LedgerAccountSerializer,
+    PostingBatchSerializer,
+    ReconciliationSerializer,
+)
 
 
 def org_filter(qs, request):
     """Limit a queryset to the authenticated organization."""
     if not hasattr(request, 'auth') or request.auth is None:
         return qs.none()
+    if request.auth == SUPER_ADMIN_MARKER:
+        org_id = request.query_params.get('organization')
+        if org_id and hasattr(qs.model, '_meta') and any(f.name == 'organization' for f in qs.model._meta.get_fields()):
+            return qs.filter(organization_id=org_id)
+        return qs
     if hasattr(request.auth, 'pk'):
         return qs.filter(organization=request.auth)
     return qs.none()
+
+
+def save_for_request_organization(serializer, request):
+    """Save a tenant-scoped record under the request organization."""
+    if request.auth == SUPER_ADMIN_MARKER:
+        org_id = request.data.get('organization') or request.query_params.get('organization')
+        if not org_id:
+            raise ValidationError({'organization': 'organization is required for super admin writes'})
+        return serializer.save(organization_id=org_id)
+    if request.auth and hasattr(request.auth, 'pk'):
+        return serializer.save(organization=request.auth)
+    raise ValidationError({'organization': 'Organization token required.'})
 
 
 class LedgerAccountViewSet(viewsets.ModelViewSet):
@@ -136,6 +164,76 @@ class ExpenseViewSet(viewsets.ModelViewSet):
         return Response({'status': 'cancelled'})
 
 
+class BankAccountViewSet(viewsets.ModelViewSet):
+    """CRUD API for bank account masters."""
+
+    queryset = BankAccount.objects.all()
+    serializer_class = BankAccountSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'accounting'
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
+
+    def perform_create(self, serializer):
+        save_for_request_organization(serializer, self.request)
+
+    def perform_update(self, serializer):
+        save_for_request_organization(serializer, self.request)
+
+
+class ChequeTransactionViewSet(viewsets.ModelViewSet):
+    """CRUD API for cheque tracking records."""
+
+    queryset = ChequeTransaction.objects.select_related('bank_account', 'party').all()
+    serializer_class = ChequeTransactionSerializer
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'accounting'
+
+    def get_queryset(self):
+        return org_filter(self.queryset, self.request)
+
+    def perform_create(self, serializer):
+        save_for_request_organization(serializer, self.request)
+
+    def perform_update(self, serializer):
+        save_for_request_organization(serializer, self.request)
+
+    @action(detail=True, methods=['post'])
+    def deposit(self, request, pk=None):
+        cheque = self.get_object()
+        cheque.deposit(notes=request.data.get('notes', ''))
+        return Response(self.get_serializer(cheque).data)
+
+    @action(detail=True, methods=['post'])
+    def clear(self, request, pk=None):
+        cheque = self.get_object()
+        cheque.clear(notes=request.data.get('notes', ''))
+        return Response(self.get_serializer(cheque).data)
+
+    @action(detail=True, methods=['post'])
+    def bounce(self, request, pk=None):
+        cheque = self.get_object()
+        cheque.bounce(notes=request.data.get('notes', ''))
+        return Response(self.get_serializer(cheque).data)
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        cheque = self.get_object()
+        cheque.cancel(notes=request.data.get('notes', ''))
+        return Response(self.get_serializer(cheque).data)
+
+
+@extend_schema_view(
+    trial_balance=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    general_ledger=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    balance_sheet=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    profit_loss=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    aging=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    party_statement=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    invoice_profit=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    expense_report=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+)
 class ReportsViewSet(viewsets.ViewSet):
     """Reporting endpoints for trial balance and financial statements."""
     permission_classes = [ScopedRolePermission]

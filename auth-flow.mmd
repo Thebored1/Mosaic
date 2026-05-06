@@ -1,0 +1,42 @@
+flowchart TD
+    A["Client"] --> B{"Public or Authenticated?"}
+
+    B -->|"Signup"| C["POST /v1/account/signup"]
+    C --> D["Create ecommerce UserAccount"]
+    D --> E["Issue ApiToken"]
+
+    B -->|"Onboard org"| F["POST /v1/account/onboard"]
+    F --> G["Create Organization + Owner"]
+    G --> E
+
+    B -->|"Login"| H["POST /v1/account/login"]
+    H --> I["Validate username/password"]
+    I --> J["Rotate or issue ApiToken"]
+    J --> K{"Transport?"}
+
+    K -->|"Bearer"| L["Return token in JSON"]
+    K -->|"Cookie"| M["Set HttpOnly mosaic_auth cookie"]
+
+    L --> N["Authenticated API request"]
+    M --> O["GET /v1/account/csrf"]
+    O --> P["Send cookie + CSRF on mutating requests"]
+    P --> N
+
+    N --> Q["ApiKeyAuthentication"]
+    Q --> R{"Token type?"}
+
+    R -->|"Org ApiToken"| S["request.auth = Organization"]
+    R -->|"Ecommerce ApiToken"| T["request.auth = ecommerce marker"]
+    R -->|"SuperAdminToken"| U["request.auth = super admin marker"]
+
+    S --> V["ScopedRolePermission checks role policy"]
+    T --> W["Allowed only buyer/public commerce paths; blocked from org APIs"]
+    U --> X["Bypasses scoped role checks"]
+
+    V --> Y["Business endpoint runs"]
+    W --> Y
+    X --> Y
+
+    Y --> Z["/me, refresh, logout available"]
+    Z --> AA["refresh rotates token"]
+    Z --> AB["logout revokes token + clears cookie"]

@@ -1,5 +1,7 @@
 """Serializers for the audit event APIs."""
 
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from .models import AuditEvent, AuditEventLink
@@ -67,7 +69,8 @@ class AuditEventSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
-    def get_model_label(self, obj):
+    @extend_schema_field(OpenApiTypes.STR)
+    def get_model_label(self, obj) -> str:
         """Return the source model label for display and filtering."""
         if obj.content_type_id:
             return f'{obj.content_type.app_label}.{obj.content_type.model}'

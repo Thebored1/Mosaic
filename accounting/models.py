@@ -338,3 +338,126 @@ class Reconciliation(models.Model):
 
     class Meta:
         ordering = ['-statement_date', '-id']
+
+
+class BankAccount(models.Model):
+    """Bank account master used for reconciliation and cheque tracking."""
+
+    ACCOUNT_TYPE_CHOICES = [
+        ('Current', 'Current'),
+        ('Savings', 'Savings'),
+        ('Cash Credit', 'Cash Credit'),
+        ('Overdraft', 'Overdraft'),
+        ('Other', 'Other'),
+    ]
+
+    organization = models.ForeignKey('account.Organization', on_delete=models.CASCADE, related_name='bank_accounts')
+    name = models.CharField(max_length=200)
+    bank_name = models.CharField(max_length=200)
+    branch_name = models.CharField(max_length=200, blank=True)
+    account_number = models.CharField(max_length=34)
+    ifsc_code = models.CharField(max_length=11, blank=True)
+    account_type = models.CharField(max_length=20, choices=ACCOUNT_TYPE_CHOICES, default='Current')
+    is_active = models.BooleanField(default=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+        unique_together = [('organization', 'account_number')]
+
+    def clean(self):
+        super().clean()
+        if self.ifsc_code:
+            self.ifsc_code = self.ifsc_code.upper()
+            if len(self.ifsc_code) != 11:
+                raise ValidationError({'ifsc_code': 'IFSC code must be exactly 11 characters.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.bank_name} - {self.account_number}'
+
+
+class ChequeTransaction(models.Model):
+    """Track issued, received, and cleared cheques for an organization."""
+
+    STATUS_CHOICES = [
+        ('Pending', 'Pending'),
+        ('Deposited', 'Deposited'),
+        ('Cleared', 'Cleared'),
+        ('Bounced', 'Bounced'),
+        ('Cancelled', 'Cancelled'),
+    ]
+    TYPE_CHOICES = [
+        ('Issued', 'Issued'),
+        ('Received', 'Received'),
+    ]
+
+    organization = models.ForeignKey('account.Organization', on_delete=models.CASCADE, related_name='cheque_transactions')
+    bank_account = models.ForeignKey(BankAccount, on_delete=models.PROTECT, related_name='cheques')
+    party = models.ForeignKey('sale.Party', on_delete=models.SET_NULL, null=True, blank=True, related_name='cheque_transactions')
+    cheque_number = models.CharField(max_length=50)
+    cheque_date = models.DateField()
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    transaction_type = models.CharField(max_length=20, choices=TYPE_CHOICES, default='Issued')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Pending')
+    deposited_at = models.DateTimeField(null=True, blank=True)
+    cleared_at = models.DateTimeField(null=True, blank=True)
+    bounced_at = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-cheque_date', '-id']
+        unique_together = [('organization', 'cheque_number')]
+
+    def clean(self):
+        super().clean()
+        if self.bank_account_id and self.bank_account.organization_id not in {None, self.organization_id}:
+            raise ValidationError({'bank_account': 'Bank account must belong to the same organization.'})
+        if self.party_id and self.party.organization_id not in {None, self.organization_id}:
+            raise ValidationError({'party': 'Party must belong to the same organization.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def deposit(self, notes=''):
+        if self.status not in {'Pending', 'Issued'}:
+            raise ValidationError('Only pending or issued cheques can be deposited.')
+        self.status = 'Deposited'
+        self.deposited_at = timezone.now()
+        if notes:
+            self.notes = notes
+        self.save(update_fields=['status', 'deposited_at', 'notes', 'updated_at'])
+
+    def clear(self, notes=''):
+        if self.status not in {'Deposited', 'Pending'}:
+            raise ValidationError('Only deposited or pending cheques can be cleared.')
+        self.status = 'Cleared'
+        self.cleared_at = timezone.now()
+        if notes:
+            self.notes = notes
+        self.save(update_fields=['status', 'cleared_at', 'notes', 'updated_at'])
+
+    def bounce(self, notes=''):
+        if self.status == 'Cleared':
+            raise ValidationError('Cleared cheques cannot be bounced.')
+        self.status = 'Bounced'
+        self.bounced_at = timezone.now()
+        if notes:
+            self.notes = notes
+        self.save(update_fields=['status', 'bounced_at', 'notes', 'updated_at'])
+
+    def cancel(self, notes=''):
+        self.status = 'Cancelled'
+        self.cancelled_at = timezone.now()
+        if notes:
+            self.notes = notes
+        self.save(update_fields=['status', 'cancelled_at', 'notes', 'updated_at'])

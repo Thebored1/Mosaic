@@ -1,8 +1,10 @@
 """Tests for the commerce catalog, cart, and checkout flows."""
 
+from datetime import timedelta
 from decimal import Decimal
 
 from django.contrib.auth.models import User
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -14,6 +16,7 @@ from .models import (
     Cart,
     CartItem,
     CommerceListing,
+    CommerceNotification,
     CommerceOrder,
     MarketplacePayout,
     MarketplaceSettlement,
@@ -23,6 +26,15 @@ from .models import (
     CommerceSettings,
     InventoryReservation,
     ShopperAddress,
+)
+from .tasks import (
+    cleanup_stale_carts,
+    expire_inventory_reservations,
+    notify_order_placed,
+    notify_shipment_update,
+    notify_return_update,
+    retry_marketplace_settlement_ready,
+    retry_marketplace_payout_process,
 )
 
 
@@ -164,6 +176,52 @@ class CommerceFlowTests(APITestCase):
         self.assertEqual(InventoryReservation.objects.count(), 1)
         self.assertEqual(InventoryReservation.objects.get().status, 'reserved')
         self.assertEqual(StockMovement.objects.filter(movement_type='Reserve').count(), 1)
+
+    def test_checkout_idempotency_returns_the_same_order(self):
+        listing = CommerceListing.objects.create(
+            organization=self.seller_org,
+            item=self.seller_item,
+            title='Seller Tee Listing',
+            description='Ready for sale',
+            price=Decimal('549.00'),
+        )
+        address = ShopperAddress.objects.create(
+            user_account=self.buyer_account,
+            label='Home',
+            recipient_name='Buyer User',
+            phone='9999999999',
+            line1='42 Market Street',
+            city='Pune',
+            postal_code='411001',
+            country='India',
+        )
+
+        self.auth(self.buyer_token)
+        self.client.post('/v1/commerce/cart-items/', {'listing_id': listing.id, 'quantity': '1.0000'}, format='json')
+
+        first = self.client.post(
+            '/v1/commerce/carts/checkout/',
+            {
+                'billing_address_id': address.id,
+                'shipping_address_id': address.id,
+            },
+            format='json',
+            HTTP_IDEMPOTENCY_KEY='checkout-001',
+        )
+        second = self.client.post(
+            '/v1/commerce/carts/checkout/',
+            {
+                'billing_address_id': address.id,
+                'shipping_address_id': address.id,
+            },
+            format='json',
+            HTTP_IDEMPOTENCY_KEY='checkout-001',
+        )
+
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(CommerceOrder.objects.count(), 1)
+        self.assertEqual(first.data['id'], second.data['id'])
 
     def test_checkout_reservation_can_be_released_before_shipment(self):
         """Checkout should reserve stock and cancellation before shipment should release it."""
@@ -468,3 +526,139 @@ class CommerceFlowTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['count'], 1)
         self.assertEqual(len(response.data['results'][0]['lines']), 1)
+
+    def test_background_jobs_abandon_old_carts_and_expire_reservations(self):
+        listing = CommerceListing.objects.create(
+            organization=self.seller_org,
+            item=self.seller_item,
+            title='Seller Tee Listing',
+            description='Ready for sale',
+            price=Decimal('549.00'),
+        )
+        cart = Cart.current_for_account(self.buyer_account)
+        CartItem.objects.create(
+            cart=cart,
+            listing=listing,
+            quantity=Decimal('1'),
+            unit_price=listing.price,
+        )
+        Cart.objects.filter(pk=cart.pk).update(updated_at=timezone.now() - timedelta(days=10))
+
+        with self.assertLogs('commerce.tasks', level='INFO') as logs:
+            cart_result = cleanup_stale_carts(days=7)
+        cart.refresh_from_db()
+        self.assertEqual(cart.status, 'abandoned')
+        self.assertEqual(cart_result['abandoned_carts'], 1)
+        self.assertTrue(any('Finished stale cart cleanup' in entry for entry in logs.output))
+
+        address = ShopperAddress.objects.create(
+            user_account=self.buyer_account,
+            label='Home',
+            recipient_name='Buyer User',
+            phone='9999999999',
+            line1='42 Market Street',
+            city='Pune',
+            postal_code='411001',
+            country='India',
+        )
+        self.auth(self.buyer_token)
+        self.client.post('/v1/commerce/cart-items/', {'listing_id': listing.id, 'quantity': '1.0000'}, format='json')
+        self.client.post('/v1/commerce/carts/checkout/', {
+            'billing_address_id': address.id,
+            'shipping_address_id': address.id,
+        }, format='json')
+        reservation = InventoryReservation.objects.get()
+        InventoryReservation.objects.filter(pk=reservation.pk).update(reserved_at=timezone.now() - timedelta(hours=48))
+
+        with self.assertLogs('commerce.tasks', level='INFO') as logs:
+            reservation_result = expire_inventory_reservations(hours=24)
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, 'expired')
+        self.assertEqual(reservation_result['expired_reservations'], 1)
+        self.assertTrue(any('Finished inventory reservation expiry' in entry for entry in logs.output))
+
+    def test_notification_and_retry_tasks_run(self):
+        listing = CommerceListing.objects.create(
+            organization=self.seller_org,
+            item=self.seller_item,
+            title='Seller Tee Listing',
+            description='Ready for sale',
+            price=Decimal('549.00'),
+        )
+        address = ShopperAddress.objects.create(
+            user_account=self.buyer_account,
+            label='Home',
+            recipient_name='Buyer User',
+            phone='9999999999',
+            line1='42 Market Street',
+            city='Pune',
+            postal_code='411001',
+            country='India',
+        )
+
+        self.auth(self.buyer_token)
+        self.client.post('/v1/commerce/cart-items/', {'listing_id': listing.id, 'quantity': '1.0000'}, format='json')
+        self.client.post('/v1/commerce/carts/checkout/', {
+            'billing_address_id': address.id,
+            'shipping_address_id': address.id,
+        }, format='json')
+        order = CommerceOrder.objects.get()
+
+        with self.assertLogs('commerce.tasks', level='INFO') as logs:
+            notify_order_placed(order.id)
+        self.assertTrue(CommerceNotification.objects.filter(notification_type='order_placed').exists())
+        self.assertTrue(any('Created order placed notifications' in entry for entry in logs.output))
+
+        shipment = CommerceShipment.objects.create(
+            organization=self.seller_org,
+            order=order,
+            method='manual',
+            status='pending',
+            carrier_name='Manual',
+            tracking_number='TRACK-NOTIFY',
+        )
+        shipment.mark_shipped()
+        with self.assertLogs('commerce.tasks', level='INFO') as logs:
+            notify_shipment_update(shipment.id)
+        self.assertTrue(CommerceNotification.objects.filter(notification_type='shipment_shipped').exists())
+        self.assertTrue(any('Creating shipment update notification' in entry for entry in logs.output))
+
+        return_request = CommerceReturnRequest.objects.create(
+            organization=self.seller_org,
+            order=order,
+            shipment=shipment,
+            order_line=order.lines.get(),
+            quantity=Decimal('1.0000'),
+            reason='Changed mind',
+        )
+        return_request.mark_received()
+        with self.assertLogs('commerce.tasks', level='INFO') as logs:
+            notify_return_update(return_request.id)
+        self.assertTrue(CommerceNotification.objects.filter(notification_type='return_received').exists())
+        self.assertTrue(any('Creating return update notification' in entry for entry in logs.output))
+
+        settlement = MarketplaceSettlement.objects.create(
+            order=order,
+            seller_organization=self.seller_org,
+            gross_amount=Decimal('100.00'),
+            commission_rate=Decimal('0.00'),
+            commission_amount=Decimal('0.00'),
+            net_amount=Decimal('100.00'),
+        )
+        with self.assertLogs('commerce.tasks', level='INFO') as logs:
+            retry_marketplace_settlement_ready(settlement.id)
+        settlement.refresh_from_db()
+        self.assertEqual(settlement.status, 'ready')
+        self.assertTrue(any('Finished settlement ready task' in entry for entry in logs.output))
+
+        payout = MarketplacePayout.objects.create(
+            settlement=settlement,
+            amount=Decimal('100.00'),
+            method='manual',
+            status='pending',
+        )
+        with self.assertLogs('commerce.tasks', level='INFO') as logs:
+            retry_marketplace_payout_process(payout.id)
+        payout.refresh_from_db()
+        self.assertEqual(payout.status, 'processed')
+        self.assertTrue(any('Finished payout process task' in entry for entry in logs.output))

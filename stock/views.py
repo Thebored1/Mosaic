@@ -13,6 +13,17 @@ The views here are intentionally opinionated because inventory is one of the
 most tenancy-sensitive parts of the application.
 """
 
+import csv
+import io
+from decimal import Decimal
+from decimal import InvalidOperation
+from datetime import timedelta
+
+from django.db import transaction
+from django.db.models import Count, Max, Sum
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from django.http import HttpResponse
 from rest_framework import viewsets
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -20,7 +31,11 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema, extend_schema_view
+from account.models import Organization
 from configuration.authentication import SUPER_ADMIN_MARKER, ECOMMERCE_MARKER, ScopedRolePermission
+from configuration.models import Warehouse
 from .models import (
     Category, Unit, AttributeType, AttributeValue,
     TaxCode, TaxComponent,
@@ -35,9 +50,29 @@ from .serializers import (
     ItemVariantSerializer, ItemVariantAttributeSerializer,
     ItemImageSerializer, BatchSerializer,
     OpeningStockSerializer, StockMovementSerializer,
-    SerialNumberSerializer
+    SerialNumberSerializer, StockTransferResponseSerializer
 )
-from .services import approve_opening_stock, post_existing_stock_movement, reject_opening_stock, reverse_stock_movement
+from .services import (
+    approve_opening_stock,
+    generate_barcode_svg,
+    generate_qr_svg,
+    post_existing_stock_movement,
+    post_stock_movement,
+    reject_opening_stock,
+    reverse_stock_movement,
+    transfer_stock_between_warehouses,
+)
+
+
+def csv_response(filename, rows):
+    """Return a CSV response body for export endpoints."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    for row in rows:
+        writer.writerow(row)
+    response = HttpResponse(buffer.getvalue(), content_type='text/csv')
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
 
 
 class StandardPagination(PageNumberPagination):
@@ -387,6 +422,133 @@ class ItemViewSet(viewsets.ModelViewSet):
         validate_serializer_relations(serializer, self.request)
         save_for_request_organization(serializer, self.request)
 
+    @action(detail=False, methods=['get'])
+    def export(self, request):
+        """Export the visible item catalog as CSV."""
+        rows = [['name', 'sku', 'category', 'unit', 'unit_price', 'cost_price', 'current_stock', 'min_stock_level', 'max_stock_level', 'is_active']]
+        for item in self.get_queryset():
+            rows.append([
+                item.name,
+                item.sku,
+                item.category.name if item.category_id else '',
+                item.unit.name if item.unit_id else '',
+                str(item.unit_price),
+                str(item.cost_price),
+                str(item.current_stock if item.current_stock is not None else ''),
+                str(item.min_stock_level),
+                str(item.max_stock_level),
+                str(item.is_active),
+            ])
+        return csv_response('items.csv', rows)
+
+    @action(detail=False, methods=['get'])
+    def import_template(self, request):
+        """Return a CSV template for item imports."""
+        rows = [[
+            'name', 'sku', 'category', 'unit', 'tax_code', 'unit_price',
+            'cost_price', 'current_stock', 'min_stock_level', 'max_stock_level',
+            'is_active', 'has_variants', 'valuation_method', 'requires_serial_tracking'
+        ]]
+        return csv_response('items-template.csv', rows)
+
+    @action(detail=False, methods=['post'])
+    def bulk_import(self, request):
+        """Validate and import item rows in a single transaction."""
+        rows = request.data.get('items')
+        if not isinstance(rows, list):
+            raise ValidationError({'items': 'items must be a list of row objects'})
+
+        org = request.auth if request.auth != SUPER_ADMIN_MARKER else None
+        errors = []
+        prepared = []
+
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                errors.append({'row': index, 'error': 'Each row must be an object'})
+                continue
+            sku = (row.get('sku') or '').strip()
+            name = (row.get('name') or '').strip()
+            if not sku or not name:
+                errors.append({'row': index, 'error': 'name and sku are required'})
+                continue
+            try:
+                unit_price = Decimal(str(row.get('unit_price', '0')))
+                cost_price = Decimal(str(row.get('cost_price', '0')))
+                current_stock = row.get('current_stock')
+                current_stock = Decimal(str(current_stock)) if current_stock not in {None, ''} else None
+                category = None
+                unit = None
+                tax_code = None
+                if row.get('category'):
+                    category = Category.objects.get(pk=row['category'])
+                if row.get('unit'):
+                    unit = Unit.objects.get(pk=row['unit'])
+                if row.get('tax_code'):
+                    tax_code = TaxCode.objects.get(pk=row['tax_code'])
+                prepared.append({
+                    'row': index,
+                    'sku': sku,
+                    'name': name,
+                    'category': category,
+                    'unit': unit,
+                    'tax_code': tax_code,
+                    'unit_price': unit_price,
+                    'cost_price': cost_price,
+                    'current_stock': current_stock,
+                    'min_stock_level': int(row.get('min_stock_level', 0)),
+                    'max_stock_level': int(row.get('max_stock_level', 0)),
+                    'is_active': str(row.get('is_active', True)).lower() not in {'false', '0', 'no'},
+                    'has_variants': str(row.get('has_variants', False)).lower() in {'true', '1', 'yes'},
+                    'valuation_method': row.get('valuation_method', 'FIFO'),
+                    'requires_serial_tracking': str(row.get('requires_serial_tracking', False)).lower() in {'true', '1', 'yes'},
+                })
+            except Exception as exc:
+                errors.append({'row': index, 'error': str(exc)})
+
+        if errors:
+            raise ValidationError({'rows': errors})
+
+        imported = []
+        with transaction.atomic():
+            for row in prepared:
+                defaults = {
+                    'organization': org,
+                    'name': row['name'],
+                    'category': row['category'],
+                    'unit': row['unit'],
+                    'tax_code': row['tax_code'],
+                    'unit_price': row['unit_price'],
+                    'cost_price': row['cost_price'],
+                    'current_stock': row['current_stock'],
+                    'min_stock_level': row['min_stock_level'],
+                    'max_stock_level': row['max_stock_level'],
+                    'is_active': row['is_active'],
+                    'has_variants': row['has_variants'],
+                    'valuation_method': row['valuation_method'],
+                    'requires_serial_tracking': row['requires_serial_tracking'],
+                }
+                item, _ = Item.objects.update_or_create(sku=row['sku'], defaults=defaults)
+                imported.append(ItemListSerializer(item).data)
+
+        return Response({'imported': imported}, status=201)
+
+    @action(detail=True, methods=['get'])
+    @extend_schema(responses=OpenApiTypes.STR)
+    def barcode(self, request, pk=None):
+        """Return a Code128 barcode SVG for the selected item."""
+        item = self.get_object()
+        svg = generate_barcode_svg(item.sku or item.name)
+        return HttpResponse(svg, content_type='image/svg+xml')
+
+    @action(detail=True, methods=['get'])
+    @extend_schema(responses=OpenApiTypes.STR)
+    def qr(self, request, pk=None):
+        """Return a QR code SVG for the selected item."""
+        item = self.get_object()
+        payload = f'item:{item.pk}|sku:{item.sku}|name:{item.name}'
+        svg = generate_qr_svg(payload)
+        return HttpResponse(svg, content_type='image/svg+xml')
+
 
 class ItemVariantViewSet(viewsets.ModelViewSet):
     """
@@ -593,6 +755,61 @@ class StockMovementViewSet(viewsets.ModelViewSet):
         )
         return Response(StockMovementSerializer(reversal).data, status=201)
 
+    @action(detail=False, methods=['post'])
+    @extend_schema(responses=StockTransferResponseSerializer)
+    def transfer(self, request):
+        """Move stock from one warehouse to another within the same organization."""
+        data = request.data
+        organization = request.auth
+        if organization == SUPER_ADMIN_MARKER:
+            org_id = data.get('organization') or request.query_params.get('organization')
+            if not org_id:
+                raise ValidationError({'organization': 'organization is required for super admin writes'})
+            organization = get_object_or_404(Organization, pk=org_id)
+
+        item_id = data.get('item')
+        from_warehouse_id = data.get('from_warehouse')
+        to_warehouse_id = data.get('to_warehouse')
+        if not all([item_id, from_warehouse_id, to_warehouse_id]):
+            raise ValidationError({'detail': 'item, from_warehouse, and to_warehouse are required.'})
+
+        item = get_object_or_404(Item.objects.select_related('category', 'unit', 'tax_code'), pk=item_id)
+        item_variant_id = data.get('item_variant')
+        item_variant = None
+        if item_variant_id:
+            item_variant = get_object_or_404(ItemVariant, pk=item_variant_id)
+
+        from_warehouse = get_object_or_404(Warehouse, pk=from_warehouse_id)
+        to_warehouse = get_object_or_404(Warehouse, pk=to_warehouse_id)
+
+        try:
+            quantity = Decimal(str(data.get('quantity', '0')))
+        except (InvalidOperation, TypeError):
+            raise ValidationError({'quantity': 'Transfer quantity must be a valid number.'})
+        if quantity <= 0:
+            raise ValidationError({'quantity': 'Transfer quantity must be greater than zero.'})
+
+        try:
+            rate = Decimal(str(data.get('rate', item.cost_price or item.unit_price or Decimal('0'))))
+        except (InvalidOperation, TypeError):
+            raise ValidationError({'rate': 'Transfer rate must be a valid number.'})
+        transfer = transfer_stock_between_warehouses(
+            organization=organization,
+            item=item,
+            from_warehouse=from_warehouse,
+            to_warehouse=to_warehouse,
+            quantity=quantity,
+            rate=rate,
+            item_variant=item_variant,
+            reference_number=data.get('reference_number', ''),
+            notes=data.get('notes', ''),
+        )
+        return Response({
+            'message': 'Stock transferred successfully',
+            'out_movement': StockMovementSerializer(transfer['out_movement']).data,
+            'in_movement': StockMovementSerializer(transfer['in_movement']).data,
+        }, status=201)
+
 
 class SerialNumberViewSet(viewsets.ModelViewSet):
     """
@@ -623,3 +840,84 @@ class SerialNumberViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         """Update a serial number under the tenant."""
         save_for_request_organization(serializer, self.request)
+
+
+@extend_schema_view(
+    valuation=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    movement_summary=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    slow_moving=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+    min_stock_alerts=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
+)
+class ReportsViewSet(viewsets.ViewSet):
+    """Stock reports for valuation and exception monitoring."""
+
+    permission_classes = [ScopedRolePermission]
+    permission_scope = 'reporting'
+
+    def get_queryset(self):
+        return org_filter(Item.objects.all(), self.request)
+
+    @action(detail=False, methods=['get'])
+    def valuation(self, request):
+        """Return a simple inventory valuation summary by item."""
+        rows = []
+        total_value = Decimal('0')
+        for item in self.get_queryset().select_related('unit'):
+            quantity = item.current_stock or Decimal('0')
+            value = (quantity * item.cost_price).quantize(Decimal('0.01'))
+            total_value += value
+            rows.append({
+                'item_id': item.id,
+                'sku': item.sku,
+                'name': item.name,
+                'quantity': str(quantity),
+                'cost_price': str(item.cost_price),
+                'value': str(value),
+            })
+        return Response({'total_value': str(total_value), 'rows': rows})
+
+    @action(detail=False, methods=['get'])
+    def movement_summary(self, request):
+        """Summarize posted stock movement activity by type."""
+        movements = org_filter(StockMovement.objects.all(), request).values('movement_type').annotate(
+            count=Count('id'),
+            total_quantity=Sum('quantity'),
+            last_movement=Max('movement_date'),
+        ).order_by('movement_type')
+        return Response({'rows': list(movements)})
+
+    @action(detail=False, methods=['get'])
+    def slow_moving(self, request):
+        """Return items with stock but no recent sale activity."""
+        days = int(request.query_params.get('days', '90'))
+        cutoff = timezone.now() - timedelta(days=days)
+        rows = []
+        for item in self.get_queryset():
+            if (item.current_stock or Decimal('0')) <= 0:
+                continue
+            last_sale = item.stock_movements.filter(movement_type='Sale').aggregate(last_sale=Max('movement_date'))['last_sale']
+            if last_sale is None or last_sale < cutoff:
+                rows.append({
+                    'item_id': item.id,
+                    'sku': item.sku,
+                    'name': item.name,
+                    'current_stock': str(item.current_stock or Decimal('0')),
+                    'last_sale': last_sale.isoformat() if last_sale else None,
+                })
+        return Response({'rows': rows})
+
+    @action(detail=False, methods=['get'])
+    def min_stock_alerts(self, request):
+        """Return items that are at or below minimum stock levels."""
+        rows = []
+        for item in self.get_queryset():
+            quantity = item.current_stock or Decimal('0')
+            if quantity <= Decimal(str(item.min_stock_level)):
+                rows.append({
+                    'item_id': item.id,
+                    'sku': item.sku,
+                    'name': item.name,
+                    'current_stock': str(quantity),
+                    'min_stock_level': item.min_stock_level,
+                })
+        return Response({'rows': rows})

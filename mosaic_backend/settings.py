@@ -13,8 +13,35 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+from celery.schedules import crontab
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def load_dotenv_file(path):
+    """
+    Load simple KEY=VALUE pairs from a local .env file.
+
+    This keeps local database settings out of the shell and avoids a new
+    dependency for the project.
+    """
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv_file(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
@@ -40,6 +67,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'django_filters',
+    'drf_spectacular',
     'account',
     'commerce',
     'stock',
@@ -84,10 +112,31 @@ WSGI_APPLICATION = 'mosaic_backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+requested_db_engine = os.environ.get('DB_ENGINE')
+if requested_db_engine and requested_db_engine != 'django.db.backends.postgresql':
+    raise ImproperlyConfigured('Only PostgreSQL is supported. Remove DB_ENGINE or set it to django.db.backends.postgresql.')
+
+DB_ENGINE = 'django.db.backends.postgresql'
+DB_NAME = os.environ.get('DB_NAME', 'mosaic_backend')
+DB_USER = os.environ.get('DB_USER', 'postgres')
+DB_PASSWORD = os.environ.get('DB_PASSWORD', '')
+DB_HOST = os.environ.get('DB_HOST', 'localhost')
+DB_PORT = os.environ.get('DB_PORT', '5432')
+DB_CONN_MAX_AGE = int(os.environ.get('DB_CONN_MAX_AGE', '60'))
+DB_CONNECT_TIMEOUT = int(os.environ.get('DB_CONNECT_TIMEOUT', '5'))
+
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': DB_ENGINE,
+        'NAME': DB_NAME,
+        'USER': DB_USER,
+        'PASSWORD': DB_PASSWORD,
+        'HOST': DB_HOST,
+        'PORT': DB_PORT,
+        'CONN_MAX_AGE': DB_CONN_MAX_AGE,
+        'OPTIONS': {
+            'connect_timeout': DB_CONNECT_TIMEOUT,
+        },
     }
 }
 
@@ -147,6 +196,12 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'anon': '60/min',
         'user': '300/min',
+        'auth_login_ip': '10/min',
+        'auth_login_identifier': '5/min',
+        'password_reset_request_ip': '5/hour',
+        'password_reset_request_identifier': '5/hour',
+        'password_reset_confirm_ip': '10/hour',
+        'password_reset_confirm_identifier': '10/hour',
     },
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 10,
@@ -155,6 +210,95 @@ REST_FRAMEWORK = {
         'rest_framework.filters.SearchFilter',
         'rest_framework.filters.OrderingFilter',
     ],
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Mosaic Backend API',
+    'DESCRIPTION': 'ERP-style multi-tenant retail backend for sales, inventory, commerce, POS, and accounting.',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'ENUM_NAME_OVERRIDES': {
+        'QuotationStatusEnum': [('Draft', 'Draft'), ('Sent', 'Sent'), ('Accepted', 'Accepted'), ('Rejected', 'Rejected'), ('Converted', 'Converted'), ('Cancelled', 'Cancelled')],
+        'TransferApprovalStatusEnum': [('Pending', 'Pending'), ('Approved', 'Approved'), ('Rejected', 'Rejected')],
+        'DeliveryChallanStatusEnum': [('Draft', 'Draft'), ('Dispatched', 'Dispatched'), ('Invoiced', 'Invoiced'), ('Cancelled', 'Cancelled')],
+        'PurchaseOrderStatusEnum': [('Draft', 'Draft'), ('Sent', 'Sent'), ('Partial', 'Partial Received'), ('Received', 'Received'), ('Cancelled', 'Cancelled')],
+        'DocumentLifecycleStatusEnum': [('Draft', 'Draft'), ('Finalized', 'Finalized'), ('Cancelled', 'Cancelled')],
+        'GrnStatusEnum': [('Draft', 'Draft'), ('Posted', 'Posted'), ('Cancelled', 'Cancelled')],
+        'UserRoleEnum': [('Owner', 'Owner'), ('Admin', 'Admin'), ('Manager', 'Manager'), ('Sales', 'Sales'), ('Delivery', 'Delivery'), ('Warehouse', 'Warehouse'), ('Staff', 'Staff')],
+        'ReceiptPaymentModeEnum': [('Cash', 'Cash'), ('Card', 'Card'), ('UPI', 'UPI'), ('Bank Transfer', 'Bank Transfer'), ('Credit', 'Credit')],
+        'TenantPrintTemplateEnum': [('standard', 'Standard'), ('compact', 'Compact'), ('thermal', 'Thermal')],
+    },
+}
+
+CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'memory://')
+CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', 'cache+memory://')
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_ALWAYS_EAGER = os.environ.get('CELERY_TASK_ALWAYS_EAGER', '0') == '1'
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_DEFAULT_QUEUE = 'default'
+CELERY_BEAT_SCHEDULE = {
+    'cleanup-stale-carts-daily': {
+        'task': 'commerce.tasks.cleanup_stale_carts',
+        'schedule': crontab(hour=2, minute=0),
+    },
+    'expire-reservations-hourly': {
+        'task': 'commerce.tasks.expire_inventory_reservations',
+        'schedule': crontab(minute=0),
+    },
+}
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'standard': {
+            'format': '%(asctime)s %(levelname)s %(name)s %(message)s',
+        },
+        'verbose': {
+            'format': '%(asctime)s %(levelname)s %(name)s [%(module)s:%(lineno)d] %(message)s',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose' if DEBUG else 'standard',
+        },
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['console'],
+            'level': os.environ.get('DJANGO_LOG_LEVEL', 'INFO'),
+        },
+        'sale': {
+            'handlers': ['console'],
+            'level': os.environ.get('APP_LOG_LEVEL', 'INFO'),
+            'propagate': False,
+        },
+        'stock': {
+            'handlers': ['console'],
+            'level': os.environ.get('APP_LOG_LEVEL', 'INFO'),
+            'propagate': False,
+        },
+        'commerce': {
+            'handlers': ['console'],
+            'level': os.environ.get('APP_LOG_LEVEL', 'INFO'),
+            'propagate': False,
+        },
+        'account': {
+            'handlers': ['console'],
+            'level': os.environ.get('APP_LOG_LEVEL', 'INFO'),
+            'propagate': False,
+        },
+        'mosaic_backend': {
+            'handlers': ['console'],
+            'level': os.environ.get('APP_LOG_LEVEL', 'INFO'),
+            'propagate': False,
+        },
+    },
 }
 
 AUTH_COOKIE_NAME = 'mosaic_auth'
@@ -164,12 +308,20 @@ AUTH_COOKIE_SECURE = not DEBUG
 AUTH_COOKIE_HTTPONLY = True
 AUTH_COOKIE_MAX_AGE = None
 
+API_TOKEN_MAX_AGE_SECONDS = int(os.environ.get('API_TOKEN_MAX_AGE_SECONDS', str(30 * 24 * 60 * 60)))
+SUPER_ADMIN_TOKEN_MAX_AGE_SECONDS = int(os.environ.get('SUPER_ADMIN_TOKEN_MAX_AGE_SECONDS', str(7 * 24 * 60 * 60)))
+
 CSRF_COOKIE_SAMESITE = 'Lax'
 CSRF_COOKIE_SECURE = not DEBUG
 CSRF_TRUSTED_ORIGINS = [
     origin for origin in os.environ.get('FRONTEND_ORIGINS', '').split(',')
     if origin
 ]
+PASSWORD_RESET_FRONTEND_URL = os.environ.get(
+    'PASSWORD_RESET_FRONTEND_URL',
+    next(iter(CSRF_TRUSTED_ORIGINS), ''),
+)
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'no-reply@mosaic.local')
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'

@@ -1,4 +1,5 @@
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from rest_framework import status
@@ -149,3 +150,34 @@ class POSTerminalTests(APITestCase):
         self.assertEqual(response.data['stock_movement_count'], 1)
         self.assertEqual(response.data['receipt_count'], 1)
         self.assertEqual(response.data['cash_in'], '118.00')
+
+    def test_shift_close_returns_validation_error_for_closed_shift(self):
+        self.auth()
+        first_response = self.client.post(
+            f'/v1/pos/shifts/{self.shift.id}/close/',
+            {'closing_cash': '500.00'},
+            format='json',
+        )
+        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
+
+        second_response = self.client.post(
+            f'/v1/pos/shifts/{self.shift.id}/close/',
+            {'closing_cash': '500.00'},
+            format='json',
+        )
+        self.assertEqual(second_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(second_response.data['detail'], ['Shift is already closed'])
+
+    def test_shift_close_returns_500_for_unexpected_errors(self):
+        self.auth()
+        with patch('pos.views.Shift.close', side_effect=RuntimeError('boom')):
+            with self.assertLogs('pos.views', level='ERROR') as logs:
+                response = self.client.post(
+                    f'/v1/pos/shifts/{self.shift.id}/close/',
+                    {'closing_cash': '500.00'},
+                    format='json',
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(response.data['detail'], 'Unexpected error while closing shift.')
+        self.assertTrue(any('Unexpected error while closing shift' in entry for entry in logs.output))

@@ -540,6 +540,7 @@ class CommerceOrder(models.Model):
     ]
 
     order_number = models.CharField(max_length=30, unique=True)
+    checkout_idempotency_key = models.CharField(max_length=80, unique=True, null=True, blank=True)
     user_account = models.ForeignKey(
         'account.UserAccount',
         on_delete=models.CASCADE,
@@ -717,7 +718,7 @@ class CommerceOrder(models.Model):
 
     @classmethod
     @transaction.atomic
-    def create_from_cart(cls, cart, billing_address=None, shipping_address=None, notes=''):
+    def create_from_cart(cls, cart, billing_address=None, shipping_address=None, notes='', checkout_idempotency_key=''):
         """
         Create a storefront order and close the source cart.
 
@@ -728,6 +729,11 @@ class CommerceOrder(models.Model):
             - recalculates totals from the frozen lines
             - marks the cart as checked out
         """
+        if checkout_idempotency_key:
+            existing_order = cls.objects.filter(checkout_idempotency_key=checkout_idempotency_key).first()
+            if existing_order is not None:
+                return existing_order
+
         if cart.status != 'open':
             raise ValidationError('Only open carts can be checked out.')
         if not cart.items.exists():
@@ -750,6 +756,7 @@ class CommerceOrder(models.Model):
             billing_snapshot=cls.address_snapshot(billing_address),
             shipping_snapshot=cls.address_snapshot(shipping_address),
             notes=notes,
+            checkout_idempotency_key=checkout_idempotency_key or None,
         )
 
         for cart_item in cart.items.select_related('listing', 'listing__item', 'listing__item_variant', 'listing__organization'):

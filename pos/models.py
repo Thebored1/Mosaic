@@ -176,7 +176,7 @@ class Shift(models.Model):
         from sale.models import Invoice
         
         return Invoice.objects.filter(
-            warehouse=self.warehouse,
+            business_location=self.warehouse,
             status='Finalized',
             created_by=self.user,
             invoice_date__gte=self.opening_time,

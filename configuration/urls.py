@@ -9,13 +9,14 @@ Endpoints:
 
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import StateViewSet, WarehouseViewSet
+from .views import StateViewSet, WarehouseViewSet, TenantSettingsViewSet
 
 
 router = DefaultRouter()
 
 router.register(r'states', StateViewSet, basename='states')
 router.register(r'warehouses', WarehouseViewSet, basename='warehouses')
+router.register(r'tenant-settings', TenantSettingsViewSet, basename='tenant-settings')
 
 
 urlpatterns = [

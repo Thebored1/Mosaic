@@ -9,7 +9,7 @@ from rest_framework.exceptions import ValidationError
 from stock.models import Batch
 from stock.services import post_stock_movement, quantize_quantity
 
-from .models import GoodReceiptNote, PurchaseOrderItem
+from .models import GoodReceiptNote, Invoice, PurchaseOrder, PurchaseOrderItem
 
 
 def _grn_batch_number(grn, grn_item):
@@ -54,18 +54,17 @@ def _recalculate_purchase_order_status(po):
 @transaction.atomic
 def post_good_receipt_note(grn, user=None):
     """Post GRN receipt quantities into stock and purchase-order receiving."""
-    grn = GoodReceiptNote.objects.select_for_update().select_related('purchase_order').get(pk=grn.pk)
+    grn = GoodReceiptNote.objects.select_for_update().get(pk=grn.pk)
     if grn.status == 'Posted':
         return grn
     if grn.status == 'Cancelled':
         raise ValidationError({'grn': 'Cancelled GRNs cannot be posted.'})
 
-    purchase_order = grn.purchase_order
     po = None
-    if purchase_order_id := getattr(purchase_order, 'pk', None):
-        po = purchase_order.__class__.objects.select_for_update().get(pk=purchase_order_id)
+    if purchase_order_id := grn.purchase_order_id:
+        po = PurchaseOrder.objects.select_for_update().get(pk=purchase_order_id)
 
-    grn_items = list(grn.grn_items.select_related('item', 'item_variant', 'unit').select_for_update())
+    grn_items = list(grn.grn_items.select_related('item').select_for_update())
     if not grn_items:
         raise ValidationError({'grn': 'GRN must contain at least one line item.'})
 
@@ -119,3 +118,28 @@ def post_good_receipt_note(grn, user=None):
     grn.posted_at = timezone.now()
     grn.save(update_fields=['status', 'posted_at'])
     return grn
+
+
+@transaction.atomic
+def generate_invoice_e_way_bill(invoice):
+    """Generate and persist the invoice e-way bill payload."""
+    invoice = Invoice.objects.select_for_update().get(pk=invoice.pk)
+    return invoice.generate_e_way_bill()
+
+
+@transaction.atomic
+def generate_invoice_e_invoice(invoice):
+    """Generate and persist the invoice e-invoice payload."""
+    invoice = Invoice.objects.select_for_update().get(pk=invoice.pk)
+    return invoice.generate_e_invoice()
+
+
+@transaction.atomic
+def generate_invoice_documents(invoice):
+    """Generate and persist GST document payloads for a finalized invoice."""
+    e_way_bill = generate_invoice_e_way_bill(invoice)
+    e_invoice_details = generate_invoice_e_invoice(invoice)
+    return {
+        'e_way_bill': e_way_bill,
+        'e_invoice_details': e_invoice_details,
+    }

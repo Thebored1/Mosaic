@@ -3,7 +3,8 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     MerchantViewSet, CustomerViewSet, UserAccountViewSet,
     PublicOnboardingView, SignupView, CsrfBootstrapView, LoginView,
-    MeView, CreateOrganizationView, RefreshTokenView, LogoutView
+    MeView, CreateOrganizationView, RefreshTokenView, LogoutView,
+    PasswordResetRequestView, PasswordResetConfirmView,
 )
 
 
@@ -22,5 +23,7 @@ urlpatterns = [
     path('create-organization/', CreateOrganizationView.as_view(), name='create-organization'),
     path('refresh/', RefreshTokenView.as_view(), name='refresh'),
     path('logout/', LogoutView.as_view(), name='logout'),
+    path('password-reset/request/', PasswordResetRequestView.as_view(), name='password-reset-request'),
+    path('password-reset/confirm/', PasswordResetConfirmView.as_view(), name='password-reset-confirm'),
     path('', include(router.urls)),
 ]

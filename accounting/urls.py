@@ -1,7 +1,17 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
-from .views import ExpenseViewSet, FiscalPeriodViewSet, JournalEntryViewSet, LedgerAccountViewSet, PostingBatchViewSet, ReconciliationViewSet, ReportsViewSet
+from .views import (
+    BankAccountViewSet,
+    ChequeTransactionViewSet,
+    ExpenseViewSet,
+    FiscalPeriodViewSet,
+    JournalEntryViewSet,
+    LedgerAccountViewSet,
+    PostingBatchViewSet,
+    ReconciliationViewSet,
+    ReportsViewSet,
+)
 
 
 router = DefaultRouter()
@@ -11,6 +21,8 @@ router.register(r'posting-batches', PostingBatchViewSet, basename='accounting-po
 router.register(r'fiscal-periods', FiscalPeriodViewSet, basename='accounting-fiscal-periods')
 router.register(r'reconciliations', ReconciliationViewSet, basename='accounting-reconciliations')
 router.register(r'expenses', ExpenseViewSet, basename='accounting-expenses')
+router.register(r'bank-accounts', BankAccountViewSet, basename='accounting-bank-accounts')
+router.register(r'cheques', ChequeTransactionViewSet, basename='accounting-cheques')
 router.register(r'reports', ReportsViewSet, basename='accounting-reports')
 
 urlpatterns = [

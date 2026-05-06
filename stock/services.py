@@ -3,6 +3,8 @@ from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
+from reportlab.graphics.barcode import createBarcodeDrawing
+from reportlab.graphics import renderSVG
 
 from .models import Batch, Item, ItemVariant, OpeningStock, SerialNumber, StockMovement
 
@@ -203,6 +205,7 @@ def _apply_inbound_batch(movement, source, quantity):
 def _apply_outbound_batch_and_serials(movement, source, quantity, warehouse=None):
     batch_allocations = []
     serials = []
+    transfer_to_warehouse_id = (movement.allocation_data or {}).get('transfer_to_warehouse_id')
 
     preferred_batch = movement.batch if movement.batch_id else None
     requires_serial_tracking = (
@@ -216,10 +219,15 @@ def _apply_outbound_batch_and_serials(movement, source, quantity, warehouse=None
     if requires_serial_tracking:
         serials = _select_serials(source, quantity, warehouse=warehouse)
         for serial in serials:
-            serial.status = 'Sold'
-            serial.sale_date = timezone.now()
-            serial.notes = movement.notes
-            serial.save(update_fields=['status', 'sale_date', 'notes', 'updated_at'])
+            if movement.movement_type == 'TransferOut' and transfer_to_warehouse_id:
+                serial.warehouse_id = transfer_to_warehouse_id
+                serial.notes = movement.notes
+                serial.save(update_fields=['warehouse', 'notes', 'updated_at'])
+            else:
+                serial.status = 'Sold'
+                serial.sale_date = timezone.now()
+                serial.notes = movement.notes
+                serial.save(update_fields=['status', 'sale_date', 'notes', 'updated_at'])
 
     return batch_allocations, serials
 
@@ -402,3 +410,76 @@ def reject_opening_stock(opening_stock, notes=''):
         opening_stock.notes = notes
     opening_stock.save(update_fields=['status', 'notes', 'updated_at'])
     return opening_stock
+
+
+@transaction.atomic
+def transfer_stock_between_warehouses(
+    *,
+    organization,
+    item,
+    from_warehouse,
+    to_warehouse,
+    quantity,
+    rate,
+    item_variant=None,
+    reference_number='',
+    notes='',
+):
+    """Create linked outbound and inbound movements for a warehouse transfer."""
+    if from_warehouse.id == to_warehouse.id:
+        raise ValidationError({'to_warehouse': 'Source and destination warehouses must be different.'})
+    if from_warehouse.organization_id != to_warehouse.organization_id:
+        raise ValidationError({'to_warehouse': 'Warehouses must belong to the same organization.'})
+    if organization != from_warehouse.organization:
+        raise ValidationError({'from_warehouse': 'Warehouse must belong to the authenticated organization.'})
+
+    reference_number = reference_number or f'TRF-{from_warehouse.code}-{to_warehouse.code}-{timezone.now():%Y%m%d%H%M%S}'
+
+    out_movement = post_stock_movement(
+        organization=from_warehouse.organization,
+        movement_type='TransferOut',
+        item=item,
+        item_variant=item_variant,
+        warehouse=from_warehouse,
+        quantity=quantity,
+        rate=rate,
+        reference_number=reference_number,
+        notes=notes,
+        status='Approved',
+        source_document_type='stock.Transfer',
+        source_document_id=reference_number,
+        source_line_reference='transfer-out',
+        allocation_data={'transfer_to_warehouse_id': to_warehouse.id},
+    )
+    in_movement = post_stock_movement(
+        organization=to_warehouse.organization,
+        movement_type='TransferIn',
+        item=item,
+        item_variant=item_variant,
+        warehouse=to_warehouse,
+        quantity=quantity,
+        rate=rate,
+        reference_number=reference_number,
+        notes=notes,
+        status='Approved',
+        source_document_type='stock.Transfer',
+        source_document_id=reference_number,
+        source_line_reference='transfer-in',
+    )
+    return {
+        'reference_number': reference_number,
+        'out_movement': out_movement,
+        'in_movement': in_movement,
+    }
+
+
+def generate_barcode_svg(value, *, human_readable=True):
+    """Generate a Code128 barcode as SVG."""
+    drawing = createBarcodeDrawing('Code128', value=str(value), humanReadable=human_readable)
+    return renderSVG.drawToString(drawing)
+
+
+def generate_qr_svg(value):
+    """Generate a QR code as SVG."""
+    drawing = createBarcodeDrawing('QR', value=str(value))
+    return renderSVG.drawToString(drawing)

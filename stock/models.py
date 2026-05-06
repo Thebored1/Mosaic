@@ -14,9 +14,12 @@ flows, so the models are explicit and strongly validated.
 """
 
 from decimal import Decimal
+import logging
 from django.db import models
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
+
+logger = logging.getLogger(__name__)
 
 
 class OrganizationModel(models.Model):
@@ -717,7 +720,10 @@ class ItemImage(OrganizationModel):
 
                     self.image.save(new_name, ContentFile(output.read()), save=False)
                 except Exception:
-                    pass
+                    logger.exception(
+                        'Failed to convert item image %s to WebP; keeping original upload',
+                        getattr(self.image, 'name', '<unknown>'),
+                    )
 
         super().save(*args, **kwargs)
 

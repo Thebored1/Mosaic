@@ -12,6 +12,11 @@ This keeps the API boundary stable while the underlying stock, payment, and
 fulfillment systems evolve independently.
 """
 
+from decimal import Decimal
+from typing import Any
+
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from account.models import Organization
@@ -120,17 +125,20 @@ class CommerceListingSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'available_quantity', 'effective_price']
 
-    def get_item_summary(self, obj):
+    @extend_schema_field(ListingItemSummarySerializer)
+    def get_item_summary(self, obj) -> dict[str, Any]:
         """Return a compact representation of the linked stock item."""
         return ListingItemSummarySerializer(obj.item).data
 
-    def get_variant_summary(self, obj):
+    @extend_schema_field(ListingVariantSummarySerializer(allow_null=True))
+    def get_variant_summary(self, obj) -> dict[str, Any] | None:
         """Return a compact representation of the linked variant, if present."""
         if obj.item_variant_id is None:
             return None
         return ListingVariantSummarySerializer(obj.item_variant).data
 
-    def get_effective_price(self, obj):
+    @extend_schema_field(serializers.DecimalField(max_digits=12, decimal_places=2))
+    def get_effective_price(self, obj) -> Decimal:
         """Resolve the buyer-specific price for the current request context."""
         request = self.context.get('request')
         account = getattr(getattr(request, 'user', None), 'account', None) if request else None
@@ -323,7 +331,8 @@ class CommerceOrderSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at', 'shipment', 'marketplace_settlements', 'lines'
         ]
 
-    def get_lines(self, obj):
+    @extend_schema_field(serializers.ListField(child=serializers.JSONField()))
+    def get_lines(self, obj) -> list[dict[str, Any]]:
         """Return order lines, optionally filtered to the seller's organization."""
         request = self.context.get('request')
         lines = obj.lines.all()
@@ -332,14 +341,16 @@ class CommerceOrderSerializer(serializers.ModelSerializer):
                 lines = lines.filter(organization=request.auth)
         return CommerceOrderLineSerializer(lines, many=True).data
 
-    def get_shipment(self, obj):
+    @extend_schema_field(OpenApiTypes.OBJECT)
+    def get_shipment(self, obj) -> dict[str, Any] | None:
         """Return the linked shipment if the order has one."""
         shipment = getattr(obj, 'shipment', None)
         if shipment is None:
             return None
         return CommerceShipmentSerializer(shipment).data
 
-    def get_marketplace_settlements(self, obj):
+    @extend_schema_field(serializers.ListField(child=serializers.JSONField()))
+    def get_marketplace_settlements(self, obj) -> list[dict[str, Any]]:
         """Return seller settlements for marketplace orders."""
         settlements = obj.marketplace_settlements.all().prefetch_related('lines', 'lines__order_line', 'payout')
         if obj.channel != 'marketplace' and not settlements.exists():
@@ -457,7 +468,8 @@ class WishlistSerializer(serializers.ModelSerializer):
         fields = ['id', 'user_account', 'channel', 'name', 'is_default', 'items', 'created_at', 'updated_at']
         read_only_fields = ['id', 'user_account', 'created_at', 'updated_at', 'items']
 
-    def get_items(self, obj):
+    @extend_schema_field(serializers.ListField(child=serializers.JSONField()))
+    def get_items(self, obj) -> list[dict[str, Any]]:
         """Return the wishlist items as nested listing snapshots."""
         return WishlistItemSerializer(obj.items.select_related('listing'), many=True).data
 

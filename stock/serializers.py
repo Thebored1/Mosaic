@@ -212,6 +212,14 @@ class StockMovementSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+class StockTransferResponseSerializer(serializers.Serializer):
+    """Shape the stock transfer response for schema generation."""
+
+    message = serializers.CharField()
+    out_movement = StockMovementSerializer(read_only=True)
+    in_movement = StockMovementSerializer(read_only=True)
+
+
 class SerialNumberSerializer(serializers.ModelSerializer):
     """
     Serialize serial-number tracked inventory.

@@ -13,6 +13,7 @@ The sale app remains the back-office ERP layer behind commerce and POS, so the
 models carry the tax and accounting state needed by those workflows.
 """
 
+import hashlib
 from decimal import Decimal
 from django.db import models, transaction
 from django.db.models import F
@@ -947,7 +948,7 @@ class Invoice(models.Model):
     ]
 
     invoice_number = models.CharField(
-        max_length=30,
+        max_length=50,
         unique=True,
         help_text="Auto-generated: GSTIN/FY/NNNNN"
     )
@@ -1191,6 +1192,53 @@ class Invoice(models.Model):
 
             from accounting.services import post_sale_invoice
             post_sale_invoice(self)
+
+    def _document_seed(self):
+        """Build a stable seed for derived GST document numbers."""
+        invoice_date = self.invoice_date.isoformat() if self.invoice_date else ''
+        return '|'.join([
+            str(self.pk or ''),
+            self.invoice_number or '',
+            self.business_location.gstin or '',
+            str(self.grand_total),
+            invoice_date,
+        ])
+
+    def generate_e_way_bill(self):
+        """Create and persist a placeholder e-way bill number."""
+        with transaction.atomic():
+            if self.status != 'Finalized':
+                raise ValidationError("E-way bill can only be generated for finalized invoices.")
+            if self.e_way_bill:
+                return self.e_way_bill
+
+            digest = hashlib.sha256(self._document_seed().encode('utf-8')).hexdigest().upper()
+            self.e_way_bill = f'EWB{digest[:12]}'
+            self.save(update_fields=['e_way_bill', 'updated_at'])
+            return self.e_way_bill
+
+    def generate_e_invoice(self):
+        """Create and persist a placeholder e-invoice payload."""
+        with transaction.atomic():
+            if self.status != 'Finalized':
+                raise ValidationError("E-invoice can only be generated for finalized invoices.")
+            if self.e_invoice_details:
+                return self.e_invoice_details
+
+            now = timezone.now()
+            digest = hashlib.sha256((self._document_seed() + '|einvoice').encode('utf-8')).hexdigest().upper()
+            ack_no = str(int(digest[:12], 16) % 10**12).zfill(12)
+            self.e_invoice_details = {
+                'status': 'generated',
+                'source': 'internal-placeholder',
+                'irn': digest,
+                'ack_no': ack_no,
+                'ack_date': now.isoformat(),
+                'generated_at': now.isoformat(),
+                'signed_qr_code': f'{self.invoice_number}|{digest[:16]}',
+            }
+            self.save(update_fields=['e_invoice_details', 'updated_at'])
+            return self.e_invoice_details
 
     def cancel(self, user):
         """
@@ -2083,7 +2131,7 @@ class PurchaseInvoice(models.Model):
         ('Cancelled', 'Cancelled'),
     ]
 
-    invoice_number = models.CharField(max_length=30, unique=True)
+    invoice_number = models.CharField(max_length=50, unique=True)
     supplier = models.ForeignKey(
         Party,
         on_delete=models.PROTECT,

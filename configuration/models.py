@@ -15,6 +15,9 @@ The models here are shared by stock, sale, pos, commerce, and account flows.
 import hashlib
 import secrets
 
+from datetime import timedelta
+
+from django.conf import settings
 from django.db import models
 from django.core.exceptions import ValidationError
 from django.utils import timezone
@@ -196,6 +199,58 @@ class Warehouse(OrganizationModel):
         super().save(*args, **kwargs)
 
 
+class TenantSettings(models.Model):
+    """
+    Tenant-wide operational settings for commerce and back-office workflows.
+
+    This keeps the business-level defaults separate from CommerceSettings so
+    the organization can control print templates, notification toggles, and
+    fiscal-year behavior in one place.
+    """
+    TEMPLATE_CHOICES = [
+        ('standard', 'Standard'),
+        ('compact', 'Compact'),
+        ('thermal', 'Thermal'),
+    ]
+
+    organization = models.OneToOneField(
+        'account.Organization',
+        on_delete=models.CASCADE,
+        related_name='tenant_settings',
+    )
+    default_warehouse = models.ForeignKey(
+        Warehouse,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='default_for_tenant_settings',
+    )
+    email_notifications_enabled = models.BooleanField(default=True)
+    sms_notifications_enabled = models.BooleanField(default=False)
+    invoice_print_template = models.CharField(max_length=20, choices=TEMPLATE_CHOICES, default='standard')
+    receipt_print_template = models.CharField(max_length=20, choices=TEMPLATE_CHOICES, default='standard')
+    delivery_note_print_template = models.CharField(max_length=20, choices=TEMPLATE_CHOICES, default='standard')
+    fiscal_year_start_month = models.PositiveSmallIntegerField(default=4)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Tenant Settings'
+        verbose_name_plural = 'Tenant Settings'
+
+    def clean(self):
+        """Validate the tenant defaults before saving."""
+        super().clean()
+        if self.default_warehouse_id and self.default_warehouse.organization_id not in {None, self.organization_id}:
+            raise ValidationError({'default_warehouse': 'Default warehouse must belong to the same organization.'})
+        if not 1 <= int(self.fiscal_year_start_month) <= 12:
+            raise ValidationError({'fiscal_year_start_month': 'Fiscal year start month must be between 1 and 12.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
 class ApiToken(models.Model):
     """
     Hashed API token linked to a UserAccount.
@@ -213,6 +268,8 @@ class ApiToken(models.Model):
     token_hash = models.CharField(max_length=64, unique=True)
     token_prefix = models.CharField(max_length=12, blank=True, default='')
     is_active = models.BooleanField(default=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -231,6 +288,14 @@ class ApiToken(models.Model):
         return secrets.token_urlsafe(32)
 
     @classmethod
+    def default_expiry(cls):
+        """Return the default expiry timestamp for newly issued tokens."""
+        max_age = int(getattr(settings, 'API_TOKEN_MAX_AGE_SECONDS', 30 * 24 * 60 * 60))
+        if max_age <= 0:
+            return None
+        return timezone.now() + timedelta(seconds=max_age)
+
+    @classmethod
     def issue_token(cls, user_account):
         """Create and persist a new token for the supplied user account."""
         raw_token = cls.generate_raw_token()
@@ -244,13 +309,14 @@ class ApiToken(models.Model):
         self.token_hash = self.hash_token(raw_token)
         self.token_prefix = raw_token[:8]
         self.token = ''
+        self.expires_at = self.default_expiry()
 
     def rotate_token(self):
         """Generate a new raw token and replace the stored hash."""
         raw_token = self.generate_raw_token()
         self.set_raw_token(raw_token)
         self.is_active = True
-        self.save(update_fields=['token_hash', 'token_prefix', 'token', 'is_active', 'updated_at'])
+        self.save(update_fields=['token_hash', 'token_prefix', 'token', 'is_active', 'expires_at', 'updated_at'])
         return raw_token
 
     def revoke_token(self):
@@ -258,6 +324,15 @@ class ApiToken(models.Model):
         self.is_active = False
         self.save(update_fields=['is_active', 'updated_at'])
         return None
+
+    def is_expired(self):
+        """Return True when the token is past its configured expiry."""
+        return self.expires_at is not None and self.expires_at <= timezone.now()
+
+    def mark_used(self):
+        """Record successful token use for audit and session hygiene."""
+        self.last_used_at = timezone.now()
+        self.save(update_fields=['last_used_at', 'updated_at'])
 
     def __str__(self):
         """Return a human-readable token label."""
@@ -284,6 +359,8 @@ class SuperAdminToken(models.Model):
     token_hash = models.CharField(max_length=64, unique=True)
     token_prefix = models.CharField(max_length=12, blank=True, default='')
     is_active = models.BooleanField(default=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -302,6 +379,14 @@ class SuperAdminToken(models.Model):
         return secrets.token_urlsafe(32)
 
     @classmethod
+    def default_expiry(cls):
+        """Return the default expiry timestamp for new super admin tokens."""
+        max_age = int(getattr(settings, 'SUPER_ADMIN_TOKEN_MAX_AGE_SECONDS', 7 * 24 * 60 * 60))
+        if max_age <= 0:
+            return None
+        return timezone.now() + timedelta(seconds=max_age)
+
+    @classmethod
     def issue_token(cls, user):
         """Create and persist a super admin token for the supplied user."""
         token = cls(user=user)
@@ -315,13 +400,14 @@ class SuperAdminToken(models.Model):
         self.token_hash = self.hash_token(raw_token)
         self.token_prefix = raw_token[:8]
         self.token = ''
+        self.expires_at = self.default_expiry()
 
     def rotate_token(self):
         """Generate a new raw token and replace the stored super admin hash."""
         raw_token = self.generate_raw_token()
         self.set_raw_token(raw_token)
         self.is_active = True
-        self.save(update_fields=['token_hash', 'token_prefix', 'token', 'is_active', 'updated_at'])
+        self.save(update_fields=['token_hash', 'token_prefix', 'token', 'is_active', 'expires_at', 'updated_at'])
         return raw_token
 
     def revoke_token(self):
@@ -329,6 +415,15 @@ class SuperAdminToken(models.Model):
         self.is_active = False
         self.save(update_fields=['is_active', 'updated_at'])
         return None
+
+    def is_expired(self):
+        """Return True when the super admin token is past its expiry."""
+        return self.expires_at is not None and self.expires_at <= timezone.now()
+
+    def mark_used(self):
+        """Record successful super admin token use."""
+        self.last_used_at = timezone.now()
+        self.save(update_fields=['last_used_at', 'updated_at'])
 
     def clean(self):
         """Ensure the token is tied to a real Django superuser account."""

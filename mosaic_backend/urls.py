@@ -19,8 +19,15 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
+
+from mosaic_backend.views import HealthCheckView
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('v1/health/', HealthCheckView.as_view(), name='health'),
+    path('v1/schema/', SpectacularAPIView.as_view(), name='schema'),
+    path('v1/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
     path('v1/api/', include('stock.urls')),
     path('v1/account/', include('account.urls')),
     path('v1/accounting/', include('accounting.urls')),

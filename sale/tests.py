@@ -1,4 +1,5 @@
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from rest_framework import status
@@ -9,6 +10,7 @@ from configuration.models import ApiToken, State, SuperAdminToken, Warehouse
 from sale.models import (
     Party, Order, OrderItem, Invoice, PriceList, PriceListItem, Quotation,
     PurchaseOrder, PurchaseOrderItem, GoodReceiptNote, GRNItem, PurchaseInvoice,
+    InvoiceItem,
 )
 from stock.models import Category, Item, ItemVariant, Batch, StockMovement
 
@@ -207,6 +209,46 @@ class SaleAuthTests(APITestCase):
         self.assertEqual(response.data['invoice_count'], 1)
         self.assertEqual(response.data['total_sales'], '100')
 
+    def test_party_export_and_bulk_import_work(self):
+        response = self.client.get(
+            '/v1/sale/parties/export/',
+            HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('party_type', response.content.decode())
+
+        import_response = self.client.post(
+            '/v1/sale/parties/bulk_import/',
+            {
+                'parties': [
+                    {
+                        'name': 'Imported Party',
+                        'party_type': 'Customer',
+                        'gstin': '27AAAAA0000A1Z5',
+                        'phone': '9999999999',
+                        'email': 'imported@example.com',
+                        'credit_limit': '1000.00',
+                        'opening_balance': '0.00',
+                        'is_active': True,
+                    }
+                ]
+            },
+            format='json',
+            HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
+        )
+        self.assertEqual(import_response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(Party.objects.filter(name='Imported Party').exists())
+
+    def test_gst_liability_report_returns_totals(self):
+        response = self.client.get(
+            '/v1/sale/reports/gst_liability/',
+            HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('net_liability', response.data)
+        self.assertIn('sales_tax', response.data)
+
     def test_price_list_update_and_quotation_conversion_uses_snapshot_price(self):
         price_list_response = self.client.patch(
             f'/v1/sale/price-lists/{self.price_list.id}/',
@@ -364,3 +406,100 @@ class SaleAuthTests(APITestCase):
         self.assertEqual(finalize_response.status_code, status.HTTP_200_OK)
         variant.refresh_from_db()
         self.assertEqual(variant.current_stock, Decimal('3.0000'))
+
+    def test_invoice_document_generation_endpoints_store_gst_payloads(self):
+        invoice = Invoice.objects.create(
+            business_location=self.warehouse,
+            party=self.party,
+            billing_state=self.state,
+            invoice_type='Tax Invoice',
+            created_by=self.sales_user,
+        )
+        InvoiceItem.objects.create(
+            invoice=invoice,
+            item=self.item,
+            quantity=Decimal('1'),
+            unit=None,
+            rate=Decimal('100.00'),
+            discount=Decimal('0.00'),
+        )
+        invoice.finalize()
+
+        response = self.client.post(
+            f'/v1/sale/invoices/{invoice.id}/generate_documents/',
+            {},
+            format='json',
+            HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('e_way_bill', response.data)
+        self.assertIn('e_invoice_details', response.data)
+
+        invoice.refresh_from_db()
+        self.assertTrue(invoice.e_way_bill)
+        self.assertTrue(invoice.e_invoice_details)
+
+    def test_invoice_finalize_logs_and_returns_500_for_unexpected_errors(self):
+        invoice = Invoice.objects.create(
+            invoice_number='INV-ERR-001',
+            invoice_type='Tax Invoice',
+            billing_state=self.state,
+            business_location=self.warehouse,
+            party=self.party,
+            grand_total=Decimal('100.00'),
+            status='Draft',
+        )
+
+        with patch('sale.views.Invoice.finalize', side_effect=RuntimeError('boom')):
+            with self.assertLogs('sale.views', level='ERROR') as logs:
+                response = self.client.post(
+                    f'/v1/sale/invoices/{invoice.id}/finalize/',
+                    {},
+                    format='json',
+                    HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(response.data['detail'], 'Unexpected error while finalizing invoice.')
+        self.assertTrue(any('Unexpected error finalizing invoice' in entry for entry in logs.output))
+
+    def test_purchase_invoice_cancel_logs_and_returns_500_for_unexpected_errors(self):
+        purchase_invoice = PurchaseInvoice.objects.create(
+            invoice_number='PINV-ERR-001',
+            supplier=self.party,
+            business_location=self.warehouse,
+            invoice_date='2026-05-01',
+            supplier_invoice_date='2026-05-01',
+            grand_total=Decimal('100.00'),
+            status='Finalized',
+        )
+
+        with patch('sale.views.PurchaseInvoice.cancel', side_effect=RuntimeError('boom')):
+            with self.assertLogs('sale.views', level='ERROR') as logs:
+                response = self.client.post(
+                    f'/v1/sale/purchase-invoices/{purchase_invoice.id}/cancel/?organization={self.organization.id}',
+                    {},
+                    format='json',
+                    HTTP_AUTHORIZATION=f'Bearer {self.super_token}',
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(response.data['detail'], 'Unexpected error while cancelling purchase invoice.')
+        self.assertTrue(any('Unexpected error cancelling purchase invoice' in entry for entry in logs.output))
+
+    def test_generate_invoice_documents_task_logs_and_fails_fast(self):
+        invoice = Invoice.objects.create(
+            business_location=self.warehouse,
+            party=self.party,
+            billing_state=self.state,
+            invoice_type='Tax Invoice',
+            created_by=self.sales_user,
+        )
+
+        with self.assertLogs('sale.tasks', level='INFO') as logs:
+            with self.assertRaisesMessage(Exception, 'E-way bill can only be generated for finalized invoices.'):
+                from sale.tasks import generate_invoice_documents
+                generate_invoice_documents(invoice.id)
+
+        self.assertTrue(any('Generating invoice documents' in entry for entry in logs.output))

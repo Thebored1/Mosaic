@@ -54,6 +54,18 @@ ACTION_ALIASES = {
     'profit_loss': 'read',
     'aging': 'read',
     'party_statement': 'read',
+    'permissions': 'read',
+    'roles': 'read',
+    'export': 'read',
+    'import_template': 'read',
+    'bulk_import': 'write',
+    'valuation': 'read',
+    'movement_summary': 'read',
+    'slow_moving': 'read',
+    'min_stock_alerts': 'read',
+    'gstr2': 'read',
+    'gst_liability': 'read',
+    'itc_reconciliation': 'read',
     'invoice_profit': 'read',
     'expense_report': 'read',
     'combine': 'write',
@@ -69,11 +81,25 @@ ACTION_ALIASES = {
     'finalize': 'write',
     'close': 'write',
     'cancel': 'write',
+    'deposit': 'write',
+    'clear': 'write',
+    'bounce': 'write',
+    'token': 'write',
+    'activate': 'write',
+    'deactivate': 'write',
+    'barcode': 'read',
+    'qr': 'read',
+    'generate_barcode': 'read',
+    'generate_qr': 'read',
     'pack': 'write',
     'ship': 'write',
     'deliver': 'write',
     'receive': 'write',
     'process': 'write',
+    'transfer': 'write',
+    'generate_e_way_bill': 'write',
+    'generate_e_invoice': 'write',
+    'generate_documents': 'write',
     'ready': 'write',
     'fail': 'write',
     'send': 'write',
@@ -88,6 +114,11 @@ ROLE_POLICIES = {
     'configuration_warehouse': {
         'read': READ_ONLY_ROLES,
         'write': MANAGEMENT_ROLES,
+        'delete': ADMIN_ROLES,
+    },
+    'tenant_settings': {
+        'read': MANAGEMENT_ROLES,
+        'write': ADMIN_ROLES,
         'delete': ADMIN_ROLES,
     },
     'stock_master': {
@@ -254,34 +285,24 @@ class ApiKeyAuthentication(authentication.BaseAuthentication):
         """
         Authenticate the incoming request and return a `(user, auth)` tuple.
 
-        The method tries cookie transport first, then bearer header transport.
-        If both are present, the header acts as an explicit override for API
-        clients.
+        Bearer headers are treated as an explicit API-client override. Browser
+        cookie transport is used only when no Authorization header is present.
         """
+        auth_header = request.headers.get('Authorization')
+        if auth_header:
+            parts = auth_header.split()
+            if len(parts) != 2:
+                raise AuthenticationFailed('Invalid authorization header format')
+            if parts[0].lower() != self.keyword.lower():
+                raise AuthenticationFailed('Authorization header must use Bearer token')
+            if not parts[1]:
+                raise AuthenticationFailed('Authorization token is missing')
+            return self.authenticate_token(parts[1])
+
         cookie_token = request.COOKIES.get(getattr(settings, 'AUTH_COOKIE_NAME', 'mosaic_auth'))
         if cookie_token:
-            try:
-                return self.authenticate_token(cookie_token)
-            except AuthenticationFailed:
-                if not request.headers.get('Authorization'):
-                    raise
-
-        auth_header = request.headers.get('Authorization')
-        if not auth_header:
-            if cookie_token:
-                return None
-            return None
-
-        parts = auth_header.split()
-        if len(parts) != 2:
-            raise AuthenticationFailed('Invalid authorization header format')
-        if parts[0].lower() != self.keyword.lower():
-            raise AuthenticationFailed('Authorization header must use Bearer token')
-        if not parts[1]:
-            raise AuthenticationFailed('Authorization token is missing')
-
-        token = parts[1]
-        return self.authenticate_token(token)
+            return self.authenticate_token(cookie_token)
+        return None
 
     def authenticate_token(self, token):
         """
@@ -298,8 +319,12 @@ class ApiKeyAuthentication(authentication.BaseAuthentication):
 
         if api_token:
             user = api_token.user_account.user
+            if api_token.is_expired():
+                api_token.revoke_token()
+                raise AuthenticationFailed('API token has expired')
             if not user.is_active or not api_token.user_account.is_active:
                 raise AuthenticationFailed('User account is inactive')
+            api_token.mark_used()
             organization = api_token.user_account.organization
             if organization is None:
                 return (user, ECOMMERCE_MARKER)
@@ -312,8 +337,12 @@ class ApiKeyAuthentication(authentication.BaseAuthentication):
         ).select_related('user').first()
 
         if super_token:
+            if super_token.is_expired():
+                super_token.revoke_token()
+                raise AuthenticationFailed('Super admin token has expired')
             if not super_token.user.is_active or not super_token.user.is_superuser:
                 raise AuthenticationFailed('Super admin account is inactive')
+            super_token.mark_used()
             return (super_token.user, SUPER_ADMIN_MARKER)
 
         raise AuthenticationFailed('Invalid or inactive API token')
@@ -368,3 +397,23 @@ class ScopedRolePermission(ApiKeyPermission):
     def has_object_permission(self, request, view, obj):
         """Delegate object-level checks to the same role policy logic."""
         return self.has_permission(request, view)
+
+
+try:
+    from drf_spectacular.extensions import OpenApiAuthenticationExtension
+
+    class ApiKeyAuthenticationScheme(OpenApiAuthenticationExtension):
+        """Describe the bearer token auth scheme for OpenAPI generation."""
+
+        target_class = 'configuration.authentication.ApiKeyAuthentication'
+        name = 'ApiKeyAuth'
+
+        def get_security_definition(self, auto_schema):
+            return {
+                'type': 'http',
+                'scheme': 'bearer',
+                'bearerFormat': 'token',
+                'description': 'Bearer token or auth cookie backed by the same token value.',
+            }
+except Exception:
+    pass

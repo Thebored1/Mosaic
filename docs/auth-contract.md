@@ -184,6 +184,38 @@ Browser response:
 Use case:
 - Explicit sign out.
 
+### `POST /v1/account/password-reset/request/`
+
+Starts password reset without revealing whether the account exists.
+
+Request fields:
+- `identifier`: username or email
+
+Response:
+- `status: ok`
+
+Server behavior:
+- If a matching user exists and has an email, the backend sends a reset link by email.
+- The API response must not include `uid`, `token`, or `reset_url`.
+- Missing users get the same response as real users.
+
+### `POST /v1/account/password-reset/confirm/`
+
+Completes password reset using the link from email.
+
+Request fields:
+- `uid`
+- `token`
+- `new_password`
+
+Response:
+- `status: password_updated`
+
+Server behavior:
+- Validates Django's password-reset token.
+- Updates the password.
+- Revokes active API and super-admin tokens for that user.
+
 ## Protected Requests
 
 ### Browser clients
@@ -235,6 +267,50 @@ The backend authenticates the request and resolves:
 4. If needed later, the authenticated user calls `create-organization/` and becomes an `Owner`.
 5. Desktop/API clients keep using bearer tokens.
 6. Client refreshes or logs out as needed.
+
+## Deployment Settings Required
+
+Password reset depends on outbound email. Configure SMTP before enabling it in any real environment.
+
+Required frontend/reset settings:
+
+```env
+FRONTEND_ORIGINS=https://app.example.com
+PASSWORD_RESET_FRONTEND_URL=https://app.example.com
+DEFAULT_FROM_EMAIL=no-reply@example.com
+```
+
+Required SMTP settings for the Django deployment:
+
+```env
+EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
+EMAIL_HOST=smtp.example.com
+EMAIL_PORT=587
+EMAIL_HOST_USER=smtp-user
+EMAIL_HOST_PASSWORD=smtp-password
+EMAIL_USE_TLS=1
+EMAIL_USE_SSL=0
+```
+
+Token lifetime settings:
+
+```env
+API_TOKEN_MAX_AGE_SECONDS=2592000
+SUPER_ADMIN_TOKEN_MAX_AGE_SECONDS=604800
+```
+
+Notes:
+- `API_TOKEN_MAX_AGE_SECONDS` defaults to 30 days.
+- `SUPER_ADMIN_TOKEN_MAX_AGE_SECONDS` defaults to 7 days.
+- Set a value less than or equal to `0` only if you intentionally want non-expiring tokens.
+- Existing tokens receive expiry during the `configuration` migration.
+
+Deployment checklist:
+- Run migrations after deploying token expiry fields.
+- Verify the SMTP account can send mail from `DEFAULT_FROM_EMAIL`.
+- Verify reset links point to the frontend route that collects `uid`, `token`, and `new_password`.
+- Keep SMTP credentials in environment or a secret manager, not in source control.
+- Do not log reset URLs or reset tokens.
 
 ## Notes
 
