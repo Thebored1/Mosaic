@@ -33,6 +33,7 @@ urlpatterns = [
     path('v1/accounting/', include('accounting.urls')),
     path('v1/commerce/', include('commerce.urls')),
     path('v1/sale/', include('sale.urls')),
+    path('v1/gst/', include('gst.urls')),
     path('v1/configuration/', include('configuration.urls')),
     path('v1/pos/', include('pos.urls')),
     path('v1/audit/', include('audit.urls')),

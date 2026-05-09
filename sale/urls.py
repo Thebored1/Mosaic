@@ -142,8 +142,6 @@ router.register(r'payments-out', PaymentOutViewSet, basename='payments-out')
 
 # Reports
 # GET /sale/reports/daily-sales/?date=2025-04-28
-# GET /sale/reports/gst-register/?start_date=2025-04-01&end_date=2025-04-30
-# GET /sale/reports/gstr1/?start_date=2025-04-01&end_date=2025-04-30
 router.register(r'reports', ReportsViewSet, basename='reports')
 
 # Quotations
@@ -224,6 +222,4 @@ PURCHASE:
 
 REPORTS:
   GET    /sale/reports/daily-sales/         - Daily sales summary
-  GET    /sale/reports/gst-register/        - GST register
-  GET    /sale/reports/gstr1/               - GSTR-1 export
 """

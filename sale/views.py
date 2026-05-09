@@ -1275,14 +1275,9 @@ class PaymentOutViewSet(viewsets.ModelViewSet):
 
 @extend_schema_view(
     daily_sales=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
-    gst_register=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
-    gstr1=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
-    gstr2=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
-    gst_liability=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
-    itc_reconciliation=extend_schema(request=None, responses=OpenApiTypes.OBJECT),
 )
 class ReportsViewSet(viewsets.ViewSet):
-    """Reporting viewset for operational and GST summaries."""
+    """Reporting viewset for operational sales summaries."""
 
     permission_classes = [ScopedRolePermission]
     permission_scope = 'reporting'
@@ -1312,137 +1307,6 @@ class ReportsViewSet(viewsets.ViewSet):
             'total_sales': format_report_decimal(invoices['total_sales']),
             'total_tax': format_report_decimal(invoices['total_tax']),
             'total_receipts': format_report_decimal(receipts['total_receipts']),
-        })
-
-    @action(detail=False, methods=['get'])
-    def gst_register(self, request):
-        """GST Sales Register - grouped by tax rate."""
-        start_date = request.query_params.get('start_date')
-        end_date = request.query_params.get('end_date')
-
-        invoices = org_filter(finalized_invoices(Invoice.objects.all()), request)
-
-        if start_date:
-            invoices = invoices.filter(invoice_date__date__gte=start_date)
-        if end_date:
-            invoices = invoices.filter(invoice_date__date__lte=end_date)
-
-        register = invoices.values('invoice_type').annotate(
-            count=Count('id'),
-            total=Sum('grand_total'),
-            taxable=Sum('taxable_amount'),
-            cgst=Sum('cgst_amount'),
-            sgst=Sum('sgst_amount'),
-            igst=Sum('igst_amount')
-        )
-
-        return Response({'register': list(register)})
-
-    @action(detail=False, methods=['get'])
-    def gstr1(self, request):
-        """GSTR-1 format export."""
-        start_date = request.query_params.get('start_date')
-        end_date = request.query_params.get('end_date')
-
-        invoices = org_filter(finalized_invoices(Invoice.objects.filter(
-            invoice_type__in=['Tax Invoice', 'Export', 'SEZ']
-        )), request)
-
-        if start_date:
-            invoices = invoices.filter(invoice_date__date__gte=start_date)
-        if end_date:
-            invoices = invoices.filter(invoice_date__date__lte=end_date)
-
-        data = []
-        for inv in invoices:
-            for item in inv.items.all():
-                data.append({
-                    'invoice_number': inv.invoice_number,
-                    'invoice_date': inv.invoice_date.strftime('%Y-%m-%d'),
-                    'party_gstin': inv.party.gstin if inv.party else '',
-                    'party_name': inv.party.name if inv.party else '',
-                    'place_of_supply': inv.billing_state.name if inv.billing_state else '',
-                    'hsn_code': item.hsn_code,
-                    'quantity': str(item.quantity),
-                    'rate': str(item.rate),
-                    'taxable_value': str(item.taxable_amount),
-                    'cgst_rate': str(item.cgst_rate),
-                    'cgst_amount': str(item.cgst_amount),
-                    'sgst_rate': str(item.sgst_rate),
-                    'sgst_amount': str(item.sgst_amount),
-                    'igst_rate': str(item.igst_rate),
-                    'igst_amount': str(item.igst_amount),
-                })
-
-        return Response({'gstr1_data': data})
-
-    @action(detail=False, methods=['get'])
-    def gstr2(self, request):
-        """GSTR-2 format inward supply summary."""
-        start_date = request.query_params.get('start_date')
-        end_date = request.query_params.get('end_date')
-        purchases = org_filter(PurchaseInvoice.objects.filter(status='Finalized'), request)
-        if start_date:
-            purchases = purchases.filter(invoice_date__date__gte=start_date)
-        if end_date:
-            purchases = purchases.filter(invoice_date__date__lte=end_date)
-
-        rows = []
-        for pi in purchases.select_related('supplier'):
-            rows.append({
-                'invoice_number': pi.invoice_number,
-                'invoice_date': pi.invoice_date.strftime('%Y-%m-%d'),
-                'supplier_name': pi.supplier.name if pi.supplier else '',
-                'supplier_gstin': pi.supplier.gstin if pi.supplier else '',
-                'taxable_amount': str(pi.taxable_amount),
-                'cgst_amount': str(pi.cgst_amount),
-                'sgst_amount': str(pi.sgst_amount),
-                'igst_amount': str(pi.igst_amount),
-                'grand_total': str(pi.grand_total),
-            })
-        return Response({'gstr2_data': rows})
-
-    @action(detail=False, methods=['get'])
-    def gst_liability(self, request):
-        """Return a simple GST liability summary."""
-        sales = org_filter(finalized_invoices(Invoice.objects.all()), request).aggregate(
-            taxable=Sum('taxable_amount'),
-            cgst=Sum('cgst_amount'),
-            sgst=Sum('sgst_amount'),
-            igst=Sum('igst_amount'),
-        )
-        purchases = org_filter(PurchaseInvoice.objects.filter(status='Finalized'), request).aggregate(
-            taxable=Sum('taxable_amount'),
-            cgst=Sum('cgst_amount'),
-            sgst=Sum('sgst_amount'),
-            igst=Sum('igst_amount'),
-        )
-        sales_tax = (sales['cgst'] or Decimal('0')) + (sales['sgst'] or Decimal('0')) + (sales['igst'] or Decimal('0'))
-        input_tax = (purchases['cgst'] or Decimal('0')) + (purchases['sgst'] or Decimal('0')) + (purchases['igst'] or Decimal('0'))
-        return Response({
-            'sales_tax': str(sales_tax),
-            'input_tax_credit': str(input_tax),
-            'net_liability': str(sales_tax - input_tax),
-        })
-
-    @action(detail=False, methods=['get'])
-    def itc_reconciliation(self, request):
-        """Return a basic input tax credit reconciliation summary."""
-        purchases = org_filter(PurchaseInvoice.objects.filter(status='Finalized'), request)
-        debit_notes = org_filter(DebitNote.objects.all(), request)
-        itc = purchases.aggregate(
-            cgst=Sum('cgst_amount'),
-            sgst=Sum('sgst_amount'),
-            igst=Sum('igst_amount'),
-        )
-        reversed_itc = debit_notes.aggregate(
-            cgst=Sum('amount'),
-        )
-        total_itc = (itc['cgst'] or Decimal('0')) + (itc['sgst'] or Decimal('0')) + (itc['igst'] or Decimal('0'))
-        return Response({
-            'eligible_itc': str(total_itc),
-            'reversed_itc': str(reversed_itc['cgst'] or Decimal('0')),
-            'net_itc': str(total_itc - (reversed_itc['cgst'] or Decimal('0'))),
         })
 
 

@@ -239,16 +239,6 @@ class SaleAuthTests(APITestCase):
         self.assertEqual(import_response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(Party.objects.filter(name='Imported Party').exists())
 
-    def test_gst_liability_report_returns_totals(self):
-        response = self.client.get(
-            '/v1/sale/reports/gst_liability/',
-            HTTP_AUTHORIZATION=f'Bearer {self.sales_token}',
-        )
-
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIn('net_liability', response.data)
-        self.assertIn('sales_tax', response.data)
-
     def test_price_list_update_and_quotation_conversion_uses_snapshot_price(self):
         price_list_response = self.client.patch(
             f'/v1/sale/price-lists/{self.price_list.id}/',

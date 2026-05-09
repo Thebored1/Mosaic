@@ -72,6 +72,7 @@ INSTALLED_APPS = [
     'commerce',
     'stock',
     'sale',
+    'gst.apps.GSTConfig',
     'accounting',
     'configuration',
     'pos',
