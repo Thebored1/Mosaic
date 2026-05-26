@@ -113,33 +113,41 @@ WSGI_APPLICATION = 'mosaic_backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
-requested_db_engine = os.environ.get('DB_ENGINE')
-if requested_db_engine and requested_db_engine != 'django.db.backends.postgresql':
-    raise ImproperlyConfigured('Only PostgreSQL is supported. Remove DB_ENGINE or set it to django.db.backends.postgresql.')
-
-DB_ENGINE = 'django.db.backends.postgresql'
-DB_NAME = os.environ.get('DB_NAME', 'mosaic_backend')
-DB_USER = os.environ.get('DB_USER', 'postgres')
-DB_PASSWORD = os.environ.get('DB_PASSWORD', '')
-DB_HOST = os.environ.get('DB_HOST', 'localhost')
-DB_PORT = os.environ.get('DB_PORT', '5432')
-DB_CONN_MAX_AGE = int(os.environ.get('DB_CONN_MAX_AGE', '60'))
-DB_CONNECT_TIMEOUT = int(os.environ.get('DB_CONNECT_TIMEOUT', '5'))
-
 DATABASES = {
     'default': {
-        'ENGINE': DB_ENGINE,
-        'NAME': DB_NAME,
-        'USER': DB_USER,
-        'PASSWORD': DB_PASSWORD,
-        'HOST': DB_HOST,
-        'PORT': DB_PORT,
-        'CONN_MAX_AGE': DB_CONN_MAX_AGE,
-        'OPTIONS': {
-            'connect_timeout': DB_CONNECT_TIMEOUT,
-        },
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
     }
 }
+
+# PostgreSQL config (commented out)
+# requested_db_engine = os.environ.get('DB_ENGINE')
+# if requested_db_engine and requested_db_engine != 'django.db.backends.postgresql':
+#     raise ImproperlyConfigured('Only PostgreSQL is supported. Remove DB_ENGINE or set it to django.db.backends.postgresql.')
+#
+# DB_ENGINE = 'django.db.backends.postgresql'
+# DB_NAME = os.environ.get('DB_NAME', 'mosaic_backend')
+# DB_USER = os.environ.get('DB_USER', 'postgres')
+# DB_PASSWORD = os.environ.get('DB_PASSWORD', '')
+# DB_HOST = os.environ.get('DB_HOST', 'localhost')
+# DB_PORT = os.environ.get('DB_PORT', '5432')
+# DB_CONN_MAX_AGE = int(os.environ.get('DB_CONN_MAX_AGE', '60'))
+# DB_CONNECT_TIMEOUT = int(os.environ.get('DB_CONNECT_TIMEOUT', '5'))
+#
+# DATABASES = {
+#     'default': {
+#         'ENGINE': DB_ENGINE,
+#         'NAME': DB_NAME,
+#         'USER': DB_USER,
+#         'PASSWORD': DB_PASSWORD,
+#         'HOST': DB_HOST,
+#         'PORT': DB_PORT,
+#         'CONN_MAX_AGE': DB_CONN_MAX_AGE,
+#         'OPTIONS': {
+#             'connect_timeout': DB_CONNECT_TIMEOUT,
+#         },
+#     }
+# }
 
 
 # Password validation
