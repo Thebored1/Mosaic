@@ -13,7 +13,7 @@ fulfillment systems evolve independently.
 """
 
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
 
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
@@ -131,7 +131,7 @@ class CommerceListingSerializer(serializers.ModelSerializer):
         return ListingItemSummarySerializer(obj.item).data
 
     @extend_schema_field(ListingVariantSummarySerializer(allow_null=True))
-    def get_variant_summary(self, obj) -> dict[str, Any] | None:
+    def get_variant_summary(self, obj) -> Optional[dict[str, Any]]:
         """Return a compact representation of the linked variant, if present."""
         if obj.item_variant_id is None:
             return None
@@ -342,7 +342,7 @@ class CommerceOrderSerializer(serializers.ModelSerializer):
         return CommerceOrderLineSerializer(lines, many=True).data
 
     @extend_schema_field(OpenApiTypes.OBJECT)
-    def get_shipment(self, obj) -> dict[str, Any] | None:
+    def get_shipment(self, obj) -> Optional[dict[str, Any]]:
         """Return the linked shipment if the order has one."""
         shipment = getattr(obj, 'shipment', None)
         if shipment is None:
