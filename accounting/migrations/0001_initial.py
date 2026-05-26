@@ -134,7 +134,7 @@ class Migration(migrations.Migration):
             ],
             options={
                 'ordering': ['line_no', 'id'],
-                'constraints': [models.CheckConstraint(condition=models.Q(('debit__gte', 0), ('credit__gte', 0)), name='journal_line_non_negative'), models.CheckConstraint(condition=models.Q(('debit__gt', 0), ('credit__gt', 0), _negated=True), name='journal_line_single_sided')],
+                'constraints': [models.CheckConstraint(check=models.Q(('debit__gte', 0), ('credit__gte', 0)), name='journal_line_non_negative'), models.CheckConstraint(check=models.Q(('debit__gt', 0), ('credit__gt', 0), _negated=True), name='journal_line_single_sided')],
             },
         ),
     ]

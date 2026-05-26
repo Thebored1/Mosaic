@@ -204,11 +204,11 @@ class JournalLine(models.Model):
         ordering = ['line_no', 'id']
         constraints = [
             models.CheckConstraint(
-                condition=Q(debit__gte=0) & Q(credit__gte=0),
+                check=Q(debit__gte=0) & Q(credit__gte=0),
                 name='journal_line_non_negative',
             ),
             models.CheckConstraint(
-                condition=~(Q(debit__gt=0) & Q(credit__gt=0)),
+                check=~(Q(debit__gt=0) & Q(credit__gt=0)),
                 name='journal_line_single_sided',
             ),
         ]
